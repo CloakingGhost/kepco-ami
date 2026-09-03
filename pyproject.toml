@@ -34,6 +34,7 @@ dev = [
     "pytest>=7.4.0",
     "black>=23.11.0",
     "ruff>=0.1.8",
+    "httpx>=0.24.0",  # FastAPI TestClient가 내부적으로 사용 (db/tests/ 통합 테스트용)
 ]
 
 [tool.hatch.build.targets.wheel]

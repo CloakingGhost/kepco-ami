@@ -183,7 +183,7 @@ class DayStatusResult:
     data_resolution: str = "15min"
 
 
-def get_store_status_day(engine: Engine, store_id: int, target_date: date) -> DayStatusResult:
+def get_store_status_day(engine: Engine, store_id: int, target_date: date) -> DayStatusResult | None:
     """
     한 매장의 하루치 상태 타임라인(15분 단위) - 전력값(recv_kWh)까지 같이 조인해서
     반환한다. data/images/user-메인-*.png의 "오늘 시간대별 전력+상태" 뷰를 이 한 번의
@@ -192,6 +192,10 @@ def get_store_status_day(engine: Engine, store_id: int, target_date: date) -> Da
     data_resolution='1hour'인 매장은 09_compute_operating_status.py가 결측 슬롯의 판정
     자체를 생략(insert 안 함)하므로 rows 길이가 96보다 짧을 수 있다 - 매장당 1개 값으로
     data_resolution을 같이 반환해 호출부(프론트)가 "빈 슬롯=결측 gap"임을 미리 알 수 있게 한다.
+
+    반환값 구분: store_id 자체가 stores에 없으면 None(호출부가 404로 매핑) - get_store_hours()와
+    동일한 패턴. 매장은 있는데 그 날짜 행이 0개면 빈 리스트([])가 든 DayStatusResult - 존재하지
+    않는 매장과 데이터가 없는 매장을 구분해야 404/200(빈 배열)을 정확히 가를 수 있다.
     """
     if target_date < EARLIEST_SAMPLE_DATE or target_date > date.today():
         raise ValueError(
@@ -209,6 +213,12 @@ def get_store_status_day(engine: Engine, store_id: int, target_date: date) -> Da
         """
     )
     with engine.connect() as conn:
+        exists = conn.execute(
+            text("SELECT 1 FROM stores WHERE store_id = :store_id"), {"store_id": store_id}
+        ).scalar_one_or_none()
+        if exists is None:
+            return None
+
         df = pd.read_sql(query, conn, params={"store_id": store_id, "target_date": target_date})
         data_resolution = conn.execute(
             text(

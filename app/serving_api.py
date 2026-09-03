@@ -149,11 +149,14 @@ def store_status_day(
     예시: `/api/stores/1/status?date=2026-08-15` -> 96개(15분×24시간) 슬롯의
     schedule_status/power_status/final_status/congestion_level + 실제 전력값(kWh).
     data/images/user-메인-*.png의 "오늘 시간대별" 차트를 이 한 번의 호출로 그릴 수 있다.
+    store_id 범위를 벗어나면 404, date가 조회 가능 범위 밖이면 400.
     """
     try:
         result = get_store_status_day(_engine, store_id, date)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"store_id={store_id}의 매장이 없습니다 (1~21 범위인지 확인하세요)")
     return {
         "store_id": store_id,
         "date": date.isoformat(),

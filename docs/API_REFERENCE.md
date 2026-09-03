@@ -3,7 +3,7 @@
 > 이 문서는 `scripts/generate_api_docs.py`가 FastAPI OpenAPI 스키마에서 **자동 생성**했습니다.
 > 코드(엔드포인트·모델)를 고쳤다면 재생성하세요: `uv run python scripts/generate_api_docs.py`
 >
-> 버전: `0.1.0` · 생성 시각: `2026-09-02 17:12 UTC`
+> 버전: `0.1.0` · 생성 시각: `2026-09-03 04:14 UTC`
 
 **Base URL(로컬)**: `http://localhost:8000`  (Swagger UI: `http://localhost:8000/docs`)
 
@@ -159,6 +159,7 @@ google_places 실측이 있으면 그걸, 없으면 ksic_estimate(업종코드 �
 예시: `/api/stores/1/status?date=2026-08-15` -> 96개(15분×24시간) 슬롯의
 schedule_status/power_status/final_status/congestion_level + 실제 전력값(kWh).
 data/images/user-메인-*.png의 "오늘 시간대별" 차트를 이 한 번의 호출로 그릴 수 있다.
+store_id 범위를 벗어나면 404, date가 조회 가능 범위 밖이면 400.
 
 **파라미터**
 
