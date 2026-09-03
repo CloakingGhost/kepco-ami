@@ -158,6 +158,45 @@ class StoreSnapshotResponse(BaseModel):
     items: list[StoreSnapshotGroup]
 
 
+class StoreDetailRequest(BaseModel):
+    store_id: int = Field(examples=[1], description="상가 ID (1~21). body로 받는 이유는 URL에 store_id를 노출하지 않기 위함")
+
+
+class StoreDetailResponse(BaseModel):
+    rating: float | None = Field(
+        default=None, examples=[4.3],
+        description="google_places_cache 최신 행의 raw_response_json.rating. Google Places 정보가 없으면 null",
+    )
+    name: str = Field(examples=["못난이찹쌀꽈배기"], description="stores.name")
+    formatted_phone_number: str | None = Field(
+        default=None, examples=["02-1234-5678"],
+        description="raw_response_json.formatted_phone_number. 010 등 휴대폰 번호인 경우도 있음. 정보 없으면 null",
+    )
+    road_address: str = Field(examples=["서울특별시 강서구 강서로12길 5"], description="stores.road_address")
+    weekday: dict[str, str] = Field(
+        description="monday~sunday 키의 요일별 영업시간 문자열(google_places 우선/ksic_estimate 폴백). "
+                    "'휴무' | '24시간' | '정보없음' 가능",
+    )
+    schedule_status: str | None = Field(
+        default=None, examples=["open_hours"], description="'open_hours' | 'closed_hours' | null(현재 상태 데이터 없음)"
+    )
+    power_status: str | None = Field(
+        default=None, examples=["active"], description="'active' | 'low' | null(현재 상태 데이터 없음)"
+    )
+    final_status: str | None = Field(
+        default=None, examples=["영업중"],
+        description="'영업중' | '휴무추정' | '영업종료' | null(현재 상태 데이터 없음) - 내부 4값 중 '예외영업'은 '영업종료'로 단순화됨",
+    )
+    biz_category_large: str | None = Field(default=None, examples=["음식"], description="stores.biz_category_large")
+    website: str | None = Field(
+        default=None, examples=["https://example.com"], description="raw_response_json.website. 없는 경우도 있음"
+    )
+    message: str | None = Field(
+        default=None, examples=[None],
+        description="Google Places 정보 부재/현재 상태 데이터 부재 등 안내 문구. 문제 없으면 null",
+    )
+
+
 class AnomalySchema(BaseModel):
     event_id: int
     meter_id: str = Field(examples=["A-L-71"])

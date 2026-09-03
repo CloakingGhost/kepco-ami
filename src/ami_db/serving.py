@@ -304,6 +304,113 @@ def get_stores_snapshot(engine: Engine, date_str: str, time_str: str) -> dict:
     return {"count": total_count, "date": date_str, "time": time_str, "items": items}
 
 
+# day_of_week(0=월요일...6=일요일, store_operating_hours 컬럼 정의 그대로 - Python
+# date.weekday()와 동일한 값)를 응답 키로 쓸 영어 요일명으로 매핑.
+_WEEKDAY_KEYS = {
+    0: "monday", 1: "tuesday", 2: "wednesday", 3: "thursday",
+    4: "friday", 5: "saturday", 6: "sunday",
+}
+
+
+def get_store_detail(engine: Engine, store_id: int) -> dict | None:
+    """
+    매장 1곳의 상세정보 - POST /api/stores(상세조회, body로 store_id를 받아 URL에
+    노출하지 않음)가 쓴다. 평점/전화번호/웹사이트(google_places_cache 최신 1행) +
+    요일별(월~일) 영업시간(store_operating_hours, google_places 우선/ksic_estimate
+    폴백) + 지금 이 순간의 영업상태/혼잡도(store_operating_status, get_current_status_one과
+    동일한 "ts<=now() 중 최신" 조회)를 한 번에 묶어 반환한다.
+
+    google_places_cache는 fetched_at 최신 1행만 쓴다 - scripts/11_refresh_google_places.py가
+    실행될 때마다 새 행이 쌓이는 insert-only 테이블이므로(과거 응답 이력 보존이 목적).
+
+    congestion_level은 스냅샷 API(get_stores_snapshot)와 동일하게 CONGESTION_LEVEL_CODE로
+    정수 인코딩하고, final_status는 FINAL_STATUS_SIMPLE_MAP으로 3값 단순화한다 - 두
+    "일반 사용자" 대상 API의 응답 규칙을 일치시키기 위함.
+
+    반환값 구분: store_id 자체가 stores에 없으면 None(호출부가 404로 매핑) - 다른
+    조회 함수들과 동일한 패턴. Google 정보나 현재 상태 데이터가 없는 건 404가 아니라
+    해당 필드를 null로 두고 message에 안내 문구를 채워 표현한다(매장 자체는 존재하므로).
+    """
+    with engine.connect() as conn:
+        store_row = conn.execute(
+            text("SELECT name, road_address, biz_category_large FROM stores WHERE store_id = :store_id"),
+            {"store_id": store_id},
+        ).mappings().first()
+        if store_row is None:
+            return None
+
+        status_row = conn.execute(
+            text(
+                """
+                SELECT schedule_status, power_status, final_status, congestion_level
+                FROM store_operating_status
+                WHERE store_id = :store_id AND ts <= now()
+                ORDER BY ts DESC
+                LIMIT 1
+                """
+            ),
+            {"store_id": store_id},
+        ).mappings().first()
+
+        places_row = conn.execute(
+            text(
+                """
+                SELECT raw_response_json ->> 'rating' AS rating,
+                       raw_response_json ->> 'formatted_phone_number' AS formatted_phone_number,
+                       raw_response_json ->> 'website' AS website
+                FROM google_places_cache
+                WHERE store_id = :store_id
+                ORDER BY fetched_at DESC
+                LIMIT 1
+                """
+            ),
+            {"store_id": store_id},
+        ).mappings().first()
+
+        hours_df = pd.read_sql(
+            text(
+                """
+                SELECT DISTINCT ON (day_of_week) day_of_week, open_time, close_time, is_closed, is_24h
+                FROM store_operating_hours
+                WHERE store_id = :store_id
+                ORDER BY day_of_week, (source = 'google_places') DESC
+                """
+            ),
+            conn,
+            params={"store_id": store_id},
+        )
+
+    hours_by_dow = {row["day_of_week"]: row for row in _records(hours_df)}
+    weekday = {
+        _WEEKDAY_KEYS[dow]: _format_store_hours(hours_by_dow.get(dow))
+        for dow in range(7)
+    }
+
+    messages = []
+    if places_row is None:
+        messages.append("Google Places 정보가 없어 평점/전화번호/웹사이트를 제공할 수 없습니다")
+    if status_row is None:
+        messages.append("현재 영업상태 데이터가 없습니다")
+
+    congestion_level = status_row["congestion_level"] if status_row else None
+    final_status = FINAL_STATUS_SIMPLE_MAP.get(status_row["final_status"]) if status_row else None
+    rating = places_row["rating"] if places_row else None
+
+    return {
+        "rating": float(rating) if rating is not None else None,
+        "name": store_row["name"],
+        "formatted_phone_number": places_row["formatted_phone_number"] if places_row else None,
+        "road_address": store_row["road_address"],
+        "weekday": weekday,
+        "schedule_status": status_row["schedule_status"] if status_row else None,
+        "power_status": status_row["power_status"] if status_row else None,
+        "final_status": final_status,
+        "biz_category_large": store_row["biz_category_large"],
+        "website": places_row["website"] if places_row else None,
+        "message": "; ".join(messages) if messages else None,
+    }
+
+
 def get_store_hours(engine: Engine, store_id: int) -> list[dict] | None:
     """
     한 매장의 요일별(월~일) "유효" 운영시간 - google_places 실측이 있으면 그걸, 없으면

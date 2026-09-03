@@ -175,10 +175,22 @@ class GooglePlacesClient:
             return None, None
 
     def search_by_name(
-        self, place_name: str, location: str = "대한민국"
+        self,
+        place_name: str,
+        location: str = "대한민국",
+        *,
+        near: tuple[float, float] | None = None,
+        radius_m: int = 500,
     ) -> tuple[Optional[PlaceInfo], Optional[dict], Optional[str]]:
         """
         매장 이름으로 검색 (텍스트 검색 1건 + 상세조회 1건, 총 2회 API 호출).
+
+        near=(latitude, longitude)를 주면 Text Search에 location/radius 편향을 걸어
+        그 좌표 반경 radius_m 이내의 결과를 우선하게 만든다 - 이름만으로 검색하면
+        동명이인 상호나 전혀 다른 지역(예: 제주도)의 결과가 1위로 잡히는 사례가
+        실측으로 확인돼서(우리 상가 DB의 21개 매장 중 다수가 이미 알고 있는 정확한
+        좌표(stores.latitude/longitude, 소상공인시장진흥공단 CSV 출처)를 갖고 있으므로
+        그 좌표로 검색을 지리적으로 좁히는 것. near가 없으면 기존과 동일하게 동작한다.
 
         Returns:
             (PlaceInfo, raw dict, place_id) 튜플. 실패 시 (None, None, None).
@@ -188,9 +200,11 @@ class GooglePlacesClient:
         print(f'🔍 검색 중: "{place_name}" in "{location}"\n')
 
         try:
-            search_results = self.client.places(
-                query=f"{place_name} {location}", language="ko"
-            )
+            search_kwargs: dict[str, object] = {"query": f"{place_name} {location}", "language": "ko"}
+            if near is not None:
+                search_kwargs["location"] = near
+                search_kwargs["radius"] = radius_m
+            search_results = self.client.places(**search_kwargs)
 
             if not search_results.get("results"):
                 print(f'❌ "{place_name}" 검색 결과가 없습니다.')

@@ -84,6 +84,28 @@ def _save_places_cache(
         )
 
 
+def _upsert_google_hours(conn, store_id: int, rows: list[HoursRow]) -> None:
+    """store_operating_hours에 google_places 소스 7행을 upsert(둘 이상 호출부가 공유하는 부분만 추출)."""
+    hours_cols = [
+        "store_id", "source", "day_of_week", "open_time", "close_time",
+        "is_closed", "is_24h", "raw_hours_text",
+    ]
+    hours_values = [
+        (store_id, "google_places", r.day_of_week, r.open_time, r.close_time,
+         r.is_closed, r.is_24h, r.raw_text)
+        for r in rows
+    ]
+    bulk_insert(
+        conn, "store_operating_hours", hours_cols, hours_values,
+        on_conflict=(
+            "(store_id, source, day_of_week) DO UPDATE SET "
+            "open_time=EXCLUDED.open_time, close_time=EXCLUDED.close_time, "
+            "is_closed=EXCLUDED.is_closed, is_24h=EXCLUDED.is_24h, "
+            "raw_hours_text=EXCLUDED.raw_hours_text, fetched_at=now()"
+        ),
+    )
+
+
 def get_or_fetch_store_hours(
     client: GooglePlacesClient, conn, store_id: int, store_name: str, location: str,
 ) -> list[HoursRow] | None:
@@ -110,25 +132,7 @@ def get_or_fetch_store_hours(
         return None
 
     rows = parse_places_hours_lines(lines)
-
-    hours_cols = [
-        "store_id", "source", "day_of_week", "open_time", "close_time",
-        "is_closed", "is_24h", "raw_hours_text",
-    ]
-    hours_values = [
-        (store_id, "google_places", r.day_of_week, r.open_time, r.close_time,
-         r.is_closed, r.is_24h, r.raw_text)
-        for r in rows
-    ]
-    bulk_insert(
-        conn, "store_operating_hours", hours_cols, hours_values,
-        on_conflict=(
-            "(store_id, source, day_of_week) DO UPDATE SET "
-            "open_time=EXCLUDED.open_time, close_time=EXCLUDED.close_time, "
-            "is_closed=EXCLUDED.is_closed, is_24h=EXCLUDED.is_24h, "
-            "raw_hours_text=EXCLUDED.raw_hours_text, fetched_at=now()"
-        ),
-    )
+    _upsert_google_hours(conn, store_id, rows)
 
     _save_places_cache(
         conn, store_id, place_id, place_info.name, lines, place_info.open_now,
@@ -136,3 +140,67 @@ def get_or_fetch_store_hours(
     )
 
     return rows
+
+
+# 매칭된 place의 formatted_address가 이 문자열을 포함하지 않으면 무조건 버린다("완전히
+# 다른 지역으로 가면 안 됨" 요구사항의 하드 게이트). 화곡동이 속한 자치구 - 21개 매장
+# 전부 stores.road_address가 이미 "서울특별시 강서구 ..."로 시작한다(00_rematch_
+# store_hwagokdong.py가 소상공인시장진흥공단 CSV를 법정동명='화곡동'으로 필터링해서
+# 만든 데이터라 전부 강서구 소속). "화곡동"까지 강제하지 않는 이유: 도로명이 인접
+# 행정구역 이름을 따르는 경우가 있어(예: 강서로5나길) 실제로 맞는 매장인데도 주소
+# 문자열에 "화곡동"이 안 보일 수 있음 - 자치구 단위가 오탐 없이 안전한 하한선.
+REQUIRED_ADDRESS_SUBSTRING = "강서구"
+
+
+def refresh_store_places_cache(
+    client: GooglePlacesClient,
+    conn,
+    store_id: int,
+    store_name: str,
+    location: str,
+    latitude: float | None = None,
+    longitude: float | None = None,
+) -> bool:
+    """
+    캐시 존재 여부를 확인하지 않고 항상 Google을 호출해 google_places_cache에 새 행을
+    적재한다(강제 갱신용 - get_or_fetch_store_hours()는 store_operating_hours에 이미
+    google_places 행이 있으면 API 자체를 호출하지 않아 "이미 캐시된 매장을 다시
+    갱신"하는 용도로 못 씀. scripts/11_refresh_google_places.py 전용).
+
+    get_or_fetch_store_hours()는 운영시간 정보가 없으면("정보 없음") caching 자체를
+    건너뛰어 rating/전화번호/웹사이트처럼 운영시간과 무관한 정보까지 함께 버렸다 -
+    이 함수는 그 결합을 깨서, place가 검색되기만 하면(운영시간 유무와 무관하게)
+    캐시는 항상 저장하고, 운영시간이 실제로 있을 때만 store_operating_hours를
+    추가로 upsert한다(store_id의 상세조회 API가 rating/전화번호/웹사이트를
+    운영시간 등록 여부와 무관하게 보여줄 수 있어야 하기 때문).
+
+    latitude/longitude(stores 테이블에 이미 있는, 소상공인시장진흥공단 CSV 출처
+    좌표)를 주면 GooglePlacesClient.search_by_name()에 그대로 전달해 검색 자체를
+    그 좌표 근방으로 편향시킨다 - 이름만으로 검색하면 동명이인 상호나 완전히 다른
+    지역(제주도 등)의 결과가 1위로 잡히는 사례가 실측으로 확인됐기 때문(21개 중
+    11개가 오매칭이었음). 그렇게 찾은 결과라도 formatted_address에
+    REQUIRED_ADDRESS_SUBSTRING이 없으면 마지막 방어선으로 거부한다.
+
+    Returns: 검증까지 통과한 place_info를 캐시에 저장했으면 True. 검색 자체가
+        실패했거나 지역 검증에서 걸러졌으면 False(아무것도 저장하지 않음).
+    """
+    near = (latitude, longitude) if latitude is not None and longitude is not None else None
+    place_info, raw, place_id = client.search_by_name(store_name, location, near=near)
+    if place_info is None:
+        return False
+
+    address = (raw or {}).get("formatted_address", "")
+    if REQUIRED_ADDRESS_SUBSTRING not in address:
+        print(f'  ⚠️  지역 검증 실패 - "{place_info.name}" 주소="{address}" ("{REQUIRED_ADDRESS_SUBSTRING}" 미포함, 폐기)')
+        return False
+
+    lines = place_info.hours.get_formatted_hours()
+    _save_places_cache(
+        conn, store_id, place_id, place_info.name, lines, place_info.open_now,
+        place_info.business_status, place_info.business_status_label, raw or {},
+    )
+
+    if not is_no_info(lines):
+        _upsert_google_hours(conn, store_id, parse_places_hours_lines(lines))
+
+    return True

@@ -37,6 +37,7 @@ from ami_db.serving import (  # noqa: E402
     get_current_status_one,
     get_meter_day_series,
     get_store_day_series,
+    get_store_detail,
     get_store_hours,
     get_store_status_day,
     get_stores_snapshot,
@@ -47,6 +48,8 @@ from app.schemas import (  # noqa: E402
     CurrentStatusOneSchema,
     DayStatusResponse,
     MeterTimeseriesResponse,
+    StoreDetailRequest,
+    StoreDetailResponse,
     StoreHoursResponse,
     StoreListResponse,
     StoreSnapshotResponse,
@@ -85,6 +88,34 @@ def health():
 def list_stores():
     """화곡동에 매칭된 21개 매장의 기본정보(이름/주소/좌표/업종) 전체. 파라미터 없음 - 바로 실행."""
     return {"stores": get_all_stores(_engine)}
+
+
+@app.post(
+    "/api/stores", tags=["매장정보"], summary="매장 1곳 상세 조회",
+    response_model=StoreDetailResponse,
+)
+def store_detail(body: StoreDetailRequest):
+    """
+    store_id를 body로 받는다(GET 경로에 store_id를 노출하지 않으려고 POST를 씀 - 목록
+    조회용 GET /api/stores와 경로는 같지만 메서드가 달라 공존한다).
+
+    평점/전화번호/웹사이트(Google Places, google_places_cache 최신 행) + 요일별(월~일)
+    영업시간 + 지금 이 순간의 영업상태/혼잡도를 한 번에 반환한다. Google Places 정보나
+    현재 상태 데이터가 없으면 해당 필드는 null이 되고 message에 안내 문구가 채워진다
+    (매장 자체는 존재하므로 404가 아니라 200으로 응답).
+
+    congestion_level은 정수 코드로 내려온다: 0=해당없음(영업중이 아니거나 데이터 없음)
+    | 1=하 | 2=중 | 3=상. final_status는 내부 4값 중 '예외영업'을 '영업종료'로 접어
+    영업중/휴무추정/영업종료 3값으로만 내려준다.
+
+    store_id가 1~21 범위를 벗어나면 404.
+    """
+    result = get_store_detail(_engine, body.store_id)
+    if result is None:
+        raise HTTPException(
+            status_code=404, detail=f"store_id={body.store_id}의 매장이 없습니다 (1~21 범위인지 확인하세요)"
+        )
+    return result
 
 
 @app.get(
