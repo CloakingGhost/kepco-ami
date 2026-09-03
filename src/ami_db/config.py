@@ -39,6 +39,7 @@ class Settings(BaseSettings):
         env_file = str(DB_ROOT / ".env")
         env_file_encoding = "utf-8"
         case_sensitive = False
+        extra = "ignore"  # .env엔 배포 준비용 DUCK_DOMAIN 등 이 앱이 안 쓰는 값도 있음 - 모르는 키를 에러로 만들지 않음
 
     @property
     def db_url(self) -> str:
