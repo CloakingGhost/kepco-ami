@@ -1,0 +1,47 @@
+[OS]
+PRETTY_NAME="Rocky Linux 9.8 (Blue Onyx)"
+
+[Memory]
+               total        used        free      shared  buff/cache   available
+Mem:           765Mi       411Mi       113Mi       4.0Mi       385Mi       353Mi
+Swap:          1.0Gi        64Mi       959Mi
+
+[Swap]
+NAME      TYPE  SIZE  USED PRIO
+/swapfile file 1024M 64.6M   -2
+
+[Disk]
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/vda2       9.0G  6.5G  2.6G  72% /
+
+[Docker]
+Docker version 29.7.2, build a7dcaa6
+
+[Docker Compose]
+Docker Compose version v5.5.0
+
+[Node.js]
+v22.23.2
+
+[npm]
+10.9.8
+
+[Corepack]
+0.34.6
+
+[pnpm]
+11.25.0
+
+[uv]
+uv 0.12.9 (x86_64-unknown-linux-gnu)
+
+[Nginx]
+nginx version: nginx/1.20.1
+
+[Services]
+active
+active
+
+=========================================
+ Server initialization finished.
+=========================================

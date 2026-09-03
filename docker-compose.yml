@@ -1,0 +1,26 @@
+# PostgreSQL / Redis 로컬 실행용.
+# Redis 필요하게 되는 시점에 사용.
+# FastAPI, Next.js는 여기 포함시키지 않고 각자 로컬에서 직접 실행합니다.
+# (앱까지 컨테이너화하는 건 9/04 배포 준비 작업에서 다룰 예정 - TODO 참고)
+#
+# TODO: 9/04 "배포준비 밑작업" 때 backend/frontend용 Dockerfile 추가 검토
+version: "3.9"
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: contest_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+#  redis:
+#    image: redis:7
+#    ports:
+#      - "6379:6379"
+
+volumes:
+  pgdata:

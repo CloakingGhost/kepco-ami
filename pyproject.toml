@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ami-db-pipeline"
+version = "0.1.0"
+description = "AMI 계기 <-> 화곡동 상가 매칭 PostgreSQL 파이프라인 (재매칭/스키마/로더/합성데이터/서빙/판정/이상치)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+# 왜 psycopg2/sqlalchemy/pandas 조합을 별도 uv 서브프로젝트로 분리했는가:
+# - 레포 전역 Python(3.13)에는 pandas/numpy는 있지만 DB 드라이버가 없고,
+# - places-api-project는 Google Places 전용 의존성만 갖고 있어 DB 코드를 섞으면 관심사가 뒤섞인다.
+# - places-api-project가 이미 세운 "서브프로젝트 = 독립 .venv + pyproject.toml + uv.lock" 컨벤션을 그대로 따른다.
+dependencies = [
+    "sqlalchemy>=2.0.0",
+    "psycopg2-binary>=2.9.9",
+    "pandas>=2.2.0",
+    "numpy>=1.26.0",
+    "pyarrow>=15.0.0",
+    "python-dotenv>=1.0.0",
+    "pydantic-settings>=2.1.0",
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    # places-api-project에서 포팅한 Google Places 클라이언트(src/ami_db/places_client.py)용.
+    # places-api-project는 더 이상 서버로 안 띄우고, Google 호출을 이 서브프로젝트가 인프로세스로 한다.
+    "googlemaps>=4.10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "black>=23.11.0",
+    "ruff>=0.1.8",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ami_db", "app"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+select = ["E", "F", "W"]
+ignore = ["E501"]
