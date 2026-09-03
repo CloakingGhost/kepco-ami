@@ -8,14 +8,43 @@
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, time
 
 import numpy as np
 import pandas as pd
 from sqlalchemy import Engine, text
 
 EARLIEST_SAMPLE_DATE = date(2026, 4, 1)
+
+# 스냅샷 API(get_stores_snapshot) 전용 상한. meter_timeseries.is_synthetic 기준
+# 실측 구간은 2026-04-01~06-30까지고 그 이후(07-01~오늘)는 합성 데이터인데,
+# 이 엔드포인트는 "AMI 샘플데이터" 자체의 날짜 범위만 받기로 했으므로 다른
+# 엔드포인트(EARLIEST_SAMPLE_DATE~date.today())와 달리 상한을 실측 마지막 날짜로
+# 고정한다 - date.today()를 쓰지 않는다.
+LATEST_SNAPSHOT_DATE = date(2026, 6, 30)
+
+_SNAPSHOT_DATE_RE = re.compile(r"^\d{2}-\d{2}-\d{2}$")
+_SNAPSHOT_TIME_RE = re.compile(r"^([01]\d|2[0-3]):(00|15|30|45)$")
+
+# 09_compute_operating_status.py가 실제 계산해 채워두는 4가지 final_status 값 중
+# '예외영업'은 프로젝트 내부용 세부 판정값이다(db/docs/영업상태_혼잡도_판정기준.md
+# 1-4/1-5절 근거: 07~10시 개점 준비시간에 몰려 발생하는 경우가 절반 이상이라
+# "심야 예외영업"이라는 이름과 실제 의미가 어긋나고, 일반 사용자에게 그대로
+# 노출하면 오인의 소지가 크다고 해당 문서가 직접 결론 내림). 이 스냅샷 API는
+# "일반 사용자" 대상이므로 영업중/영업종료/휴무추정 3값으로 단순화해서 내려준다.
+FINAL_STATUS_SIMPLE_MAP = {
+    "영업중": "영업중",
+    "휴무추정": "휴무추정",
+    "예외영업": "영업종료",
+    "영업종료": "영업종료",
+}
+
+# congestion_level을 프론트가 바로 정렬/비교에 쓸 수 있도록 정수 코드로 내려준다.
+# 0은 "혼잡도 판단 불가"를 뜻하며 두 경우를 모두 포함한다: final_status != '영업중'
+# (원래도 congestion_level이 NULL) 이거나, 해당 시각의 데이터 자체가 없는 경우.
+CONGESTION_LEVEL_CODE = {None: 0, "하": 1, "중": 2, "상": 3}
 
 
 def _records(df: pd.DataFrame) -> list[dict]:
@@ -141,6 +170,138 @@ def get_current_status_one(engine: Engine, store_id: int) -> dict | None:
     with engine.connect() as conn:
         df = pd.read_sql(query, conn, params={"store_id": store_id})
     return _records(df)[0] if not df.empty else None
+
+
+def parse_snapshot_date(date_str: str) -> date:
+    """
+    스냅샷 조회용 날짜 파싱. 형식은 'YY-MM-DD'(예: '26-05-09') - ISO 형식(YYYY-MM-DD)과
+    다르게 연도를 2자리로 받으라는 요구사항이라 FastAPI 기본 date 타입을 못 쓰고
+    문자열로 받아 여기서 직접 파싱/검증한다.
+    """
+    if not _SNAPSHOT_DATE_RE.match(date_str):
+        raise ValueError(f"date는 'YY-MM-DD' 형식이어야 합니다 (입력: {date_str!r}, 예: '26-05-09')")
+    try:
+        parsed = datetime.strptime(date_str, "%y-%m-%d").date()
+    except ValueError as e:
+        raise ValueError(f"date를 파싱할 수 없습니다 (입력: {date_str!r}): {e}") from e
+    if parsed < EARLIEST_SAMPLE_DATE or parsed > LATEST_SNAPSHOT_DATE:
+        raise ValueError(
+            f"date는 {EARLIEST_SAMPLE_DATE} ~ {LATEST_SNAPSHOT_DATE} 범위여야 합니다 (입력: {parsed})"
+        )
+    return parsed
+
+
+def parse_snapshot_time(time_str: str) -> time:
+    """스냅샷 조회용 시각 파싱. 'HH:MM'(00:00~23:45, 15분 단위)만 허용한다."""
+    if not _SNAPSHOT_TIME_RE.match(time_str):
+        raise ValueError(
+            f"time은 'HH:MM' 형식이며 분은 00/15/30/45 중 하나여야 합니다 (입력: {time_str!r}, 예: '19:15')"
+        )
+    hour_str, minute_str = time_str.split(":")
+    return time(int(hour_str), int(minute_str))
+
+
+def _time_to_str(value) -> str:
+    if isinstance(value, str):
+        return value[:5]
+    return value.strftime("%H:%M")
+
+
+def _format_store_hours(row: dict | None) -> str:
+    if row is None:
+        return "정보없음"
+    if row.get("is_closed"):
+        return "휴무"
+    if row.get("is_24h"):
+        return "24시간"
+    open_t, close_t = row.get("open_time"), row.get("close_time")
+    if open_t is None or close_t is None:
+        return "정보없음"
+    return f"{_time_to_str(open_t)}-{_time_to_str(close_t)}"
+
+
+def get_stores_snapshot(engine: Engine, date_str: str, time_str: str) -> dict:
+    """
+    입력된 날짜+시각 한 시점에서 21개 매장 전체의 스냅샷(위치/영업상태/혼잡도/전력사용량)을
+    한 번에 반환한다. "이 시각 기준 지도"를 그리려고 매장마다 따로 호출할 필요 없게 만드는
+    목적(get_current_status_all의 "지금 이 순간" 버전을 "임의 과거/미래 시각"으로 일반화한 것).
+
+    해상도 처리: 매장의 계기가 data_resolution='1hour'이면 15/30/45분 슬롯 자체가
+    없으므로(09_compute_operating_status.py가 결측 슬롯 판정을 생략) 입력 시각의 "시"만
+    써서 정각 슬롯을 조회하고, '15min'이면 입력 시각 그대로 조회한다. 매장별로 그 시점
+    데이터가 아예 없으면(정각 슬롯 자체가 결측) 상태 관련 필드를 전부 null로 두고
+    message에 안내 문구를 채운다 - 없는 데이터를 다른 값으로 대체하지 않는다.
+
+    final_status는 09단계가 실제로 계산하는 4값('영업중'/'휴무추정'/'예외영업'/'영업종료')
+    중 '예외영업'을 '영업종료'로 접어 3값으로 단순화해서 내려준다(FINAL_STATUS_SIMPLE_MAP
+    주석 참고 - 일반 사용자 대상 API라 "영업중인지 아닌지"만 판단하면 되기 때문).
+    """
+    target_date = parse_snapshot_date(date_str)
+    target_time = parse_snapshot_time(time_str)
+    ts_exact = datetime.combine(target_date, target_time)
+    ts_hourly = datetime.combine(target_date, time(target_time.hour, 0))
+
+    query = text(
+        """
+        SELECT
+            s.store_id, s.meter_id, s.name, s.road_address, s.longitude, s.latitude,
+            s.biz_category_large,
+            m.line_name,
+            sos.ts AS status_ts, sos.schedule_status, sos.power_status,
+            sos.final_status, sos.congestion_level,
+            mt.received_active_power_kwh
+        FROM stores s
+        JOIN meters m ON m.meter_id = s.meter_id
+        LEFT JOIN store_operating_status sos
+            ON sos.store_id = s.store_id
+            AND sos.ts = CASE WHEN m.data_resolution = '1hour' THEN :ts_hourly ELSE :ts_exact END
+        LEFT JOIN meter_timeseries mt
+            ON mt.meter_id = s.meter_id
+            AND mt.ts = CASE WHEN m.data_resolution = '1hour' THEN :ts_hourly ELSE :ts_exact END
+        ORDER BY s.store_id
+        """
+    )
+    hours_query = text(
+        """
+        SELECT DISTINCT ON (store_id) store_id, open_time, close_time, is_closed, is_24h
+        FROM store_operating_hours
+        WHERE day_of_week = :dow
+        ORDER BY store_id, (source = 'google_places') DESC
+        """
+    )
+    with engine.connect() as conn:
+        stores_df = pd.read_sql(query, conn, params={"ts_exact": ts_exact, "ts_hourly": ts_hourly})
+        hours_df = pd.read_sql(hours_query, conn, params={"dow": target_date.weekday()})
+
+    stores_df["has_data"] = stores_df["status_ts"].notna()
+    hours_by_store = {row["store_id"]: row for row in _records(hours_df)}
+
+    groups: dict[str, list[dict]] = {}
+    for row in _records(stores_df):
+        has_data = bool(row["has_data"])
+        hours_row = hours_by_store.get(row["store_id"])
+        congestion_level = row["congestion_level"] if has_data else None
+        item = {
+            "meter_id": row["meter_id"],
+            "latitude": row["latitude"],
+            "longitude": row["longitude"],
+            "congestion_level": CONGESTION_LEVEL_CODE[congestion_level],
+            "name": row["name"],
+            "road_address": row["road_address"],
+            "business_hours": _format_store_hours(hours_row),
+            "schedule_status": row["schedule_status"] if has_data else None,
+            "power_status": row["power_status"] if has_data else None,
+            "final_status": FINAL_STATUS_SIMPLE_MAP.get(row["final_status"]) if has_data else None,
+            "received_active_power_kwh": row["received_active_power_kwh"],
+            "biz_category_large": row["biz_category_large"],
+            "message": None if has_data else "해당 시각에 저장된 데이터가 없습니다",
+        }
+        groups.setdefault(row["line_name"], []).append(item)
+
+    items = [{"line_name": line_name, "stores": stores} for line_name, stores in groups.items()]
+    total_count = sum(len(g["stores"]) for g in items)
+
+    return {"count": total_count, "date": date_str, "time": time_str, "items": items}
 
 
 def get_store_hours(engine: Engine, store_id: int) -> list[dict] | None:

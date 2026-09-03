@@ -30,6 +30,7 @@ from fastapi import FastAPI, HTTPException, Path as PathParam, Query  # noqa: E4
 from ami_db.db import get_engine  # noqa: E402
 from ami_db.serving import (  # noqa: E402
     EARLIEST_SAMPLE_DATE,
+    LATEST_SNAPSHOT_DATE,
     get_all_stores,
     get_anomalies,
     get_current_status_all,
@@ -38,6 +39,7 @@ from ami_db.serving import (  # noqa: E402
     get_store_day_series,
     get_store_hours,
     get_store_status_day,
+    get_stores_snapshot,
 )
 from app.schemas import (  # noqa: E402
     AnomalyListResponse,
@@ -47,6 +49,7 @@ from app.schemas import (  # noqa: E402
     MeterTimeseriesResponse,
     StoreHoursResponse,
     StoreListResponse,
+    StoreSnapshotResponse,
     StoreTimeseriesResponse,
 )
 
@@ -98,8 +101,53 @@ def list_current_status():
 
 
 @app.get(
+    "/api/stores/snapshot", tags=["영업유무·혼잡도"], summary="특정 날짜·시각의 전체 매장 스냅샷",
+    response_model=StoreSnapshotResponse,
+)
+def stores_snapshot(
+    date: str = Query(
+        ...,
+        description=f"조회할 날짜, 'YY-MM-DD' 형식(연도 2자리). 범위: "
+                    f"{EARLIEST_SAMPLE_DATE.strftime('%y-%m-%d')} ~ {LATEST_SNAPSHOT_DATE.strftime('%y-%m-%d')} "
+                    f"(AMI 샘플데이터 실측 구간).",
+        examples=["26-05-09"],
+    ),
+    time: str = Query(
+        ...,
+        description="조회할 시각, 'HH:MM' 형식(00:00~23:45, 15분 단위만 허용: 00/15/30/45).",
+        examples=["19:15"],
+    ),
+):
+    """
+    예시: `/api/stores/snapshot?date=26-05-09&time=19:15` -> 그 시점 21개 매장의
+    위치/영업상태/혼잡도/전력사용량을 한 번에 반환한다.
+
+    조회 가능 날짜 범위는 AMI 샘플데이터의 시작일~마지막일인 2026-04-01~2026-06-30로
+    고정된다(다른 엔드포인트처럼 오늘까지의 합성 구간을 포함하지 않음).
+
+    계기 해상도 처리: data_resolution='1hour'인 매장(5개)은 15/30/45분 슬롯이 애초에
+    없으므로 입력 시각의 "시"만 사용해 정각 데이터를 가져온다(예: 19:15 입력 -> 19:00 슬롯).
+    나머지 '15min' 매장은 입력 시각을 그대로 사용한다. 매장별로 그 시점 데이터 자체가
+    없으면(정각 슬롯 결측 등) 상태 관련 필드가 전부 null이 되고 message에 안내 문구가 채워진다.
+
+    final_status는 내부 4값 중 '예외영업'을 '영업종료'로 접어 영업중/휴무추정/영업종료
+    3값으로만 내려준다(일반 사용자는 영업 중인지 아닌지만 판단하면 되기 때문).
+
+    congestion_level은 문자열이 아니라 정수 코드로 내려온다: 0=해당없음(영업중이
+    아니거나 데이터 없음) | 1=하 | 2=중 | 3=상.
+
+    date/time 형식이 잘못됐거나 date가 조회 가능 범위를 벗어나면 400.
+    """
+    try:
+        return get_stores_snapshot(_engine, date, time)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get(
     "/api/stores/{store_id}/status/current", tags=["영업유무·혼잡도"], summary="매장 1곳 현재 상태",
     response_model=CurrentStatusOneSchema,
+    include_in_schema=False
 )
 def store_current_status(
     store_id: int = PathParam(..., description="상가 ID (1~21)", examples=[EXAMPLE_STORE_ID]),
@@ -117,6 +165,7 @@ def store_current_status(
 @app.get(
     "/api/stores/{store_id}/hours", tags=["영업유무·혼잡도"], summary="매장 1곳의 요일별 운영시간",
     response_model=StoreHoursResponse,
+    include_in_schema=False
 )
 def store_hours(
     store_id: int = PathParam(..., description="상가 ID (1~21)", examples=[EXAMPLE_STORE_ID]),
@@ -135,6 +184,7 @@ def store_hours(
 @app.get(
     "/api/stores/{store_id}/status", tags=["영업유무·혼잡도"], summary="매장 1곳의 하루 상태+전력 타임라인",
     response_model=DayStatusResponse,
+    include_in_schema=False
 )
 def store_status_day(
     store_id: int = PathParam(..., description="상가 ID (1~21)", examples=[EXAMPLE_STORE_ID]),

@@ -3,7 +3,7 @@
 > 이 문서는 `scripts/generate_api_docs.py`가 FastAPI OpenAPI 스키마에서 **자동 생성**했습니다.
 > 코드(엔드포인트·모델)를 고쳤다면 재생성하세요: `uv run python scripts/generate_api_docs.py`
 >
-> 버전: `0.1.0` · 생성 시각: `2026-09-03 04:14 UTC`
+> 버전: `0.1.0` · 생성 시각: `2026-09-03 16:02 UTC`
 
 **Base URL(로컬)**: `http://localhost:8000`  (Swagger UI: `http://localhost:8000/docs`)
 
@@ -87,6 +87,55 @@
 | `power_status` | `string` | 'active' | 'low' - 야간 baseline 대비 실측 전력 기준 판정 |
 | `final_status` | `string` | '영업중' | '휴무추정' | '예외영업' | '영업종료' |
 | `congestion_level` | `string \| null` | '상' | '중' | '하' | null(영업중이 아니면 null) |
+
+</details>
+
+---
+
+### `GET /api/stores/snapshot`
+**특정 날짜·시각의 전체 매장 스냅샷**
+
+예시: `/api/stores/snapshot?date=26-05-09&time=19:15` -> 그 시점 21개 매장의
+위치/영업상태/혼잡도/전력사용량을 한 번에 반환한다.
+
+조회 가능 날짜 범위는 AMI 샘플데이터의 시작일~마지막일인 2026-04-01~2026-06-30로
+고정된다(다른 엔드포인트처럼 오늘까지의 합성 구간을 포함하지 않음).
+
+계기 해상도 처리: data_resolution='1hour'인 매장(5개)은 15/30/45분 슬롯이 애초에
+없으므로 입력 시각의 "시"만 사용해 정각 데이터를 가져온다(예: 19:15 입력 -> 19:00 슬롯).
+나머지 '15min' 매장은 입력 시각을 그대로 사용한다. 매장별로 그 시점 데이터 자체가
+없으면(정각 슬롯 결측 등) 상태 관련 필드가 전부 null이 되고 message에 안내 문구가 채워진다.
+
+final_status는 내부 4값 중 '예외영업'을 '영업종료'로 접어 영업중/휴무추정/영업종료
+3값으로만 내려준다(일반 사용자는 영업 중인지 아닌지만 판단하면 되기 때문).
+
+congestion_level은 문자열이 아니라 정수 코드로 내려온다: 0=해당없음(영업중이
+아니거나 데이터 없음) | 1=하 | 2=중 | 3=상.
+
+date/time 형식이 잘못됐거나 date가 조회 가능 범위를 벗어나면 400.
+
+**파라미터**
+
+| 이름 | 위치 | 타입 | 필수 | 예시 | 설명 |
+|---|---|---|:---:|---|---|
+| `date` | query | `string` | O | 26-05-09 | 조회할 날짜, 'YY-MM-DD' 형식(연도 2자리). 범위: 26-04-01 ~ 26-06-30 (AMI 샘플데이터 실측 구간). |
+| `time` | query | `string` | O | 19:15 | 조회할 시각, 'HH:MM' 형식(00:00~23:45, 15분 단위만 허용: 00/15/30/45). |
+
+**응답 (200)** — `StoreSnapshotResponse`
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `count` | `integer` |  |
+| `date` | `string` | 입력값 그대로 |
+| `time` | `string` | 입력값 그대로(계기별 해상도 적용은 서버 내부에서 처리됨) |
+| `items` | `StoreSnapshotGroup[]` |  |
+
+<details><summary><code>StoreSnapshotGroup</code> 필드 상세</summary>
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `line_name` | `string` |  |
+| `stores` | `StoreSnapshotItem[]` |  |
 
 </details>
 

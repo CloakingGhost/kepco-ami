@@ -109,6 +109,55 @@ class DayStatusResponse(BaseModel):
     )
 
 
+class StoreSnapshotItem(BaseModel):
+    meter_id: str = Field(examples=["A-L-11"], description="stores.meter_id")
+    latitude: float | None = Field(default=None, examples=[37.5315885537006], description="stores.latitude")
+    longitude: float | None = Field(default=None, examples=[126.847366517265], description="stores.longitude")
+    congestion_level: int = Field(
+        examples=[2],
+        description="혼잡도 코드. 0=해당없음(영업중이 아니거나 해당 시각 데이터 없음) | 1=하 | 2=중 | 3=상",
+    )
+    name: str = Field(examples=["못난이찹쌀꽈배기"], description="stores.name")
+    road_address: str = Field(examples=["서울특별시 강서구 강서로12길 5"], description="stores.road_address")
+    business_hours: str = Field(
+        examples=["09:00-18:00"],
+        description="조회 날짜의 요일 기준 영업시간(store_operating_hours). '휴무' | '24시간' | '정보없음' 가능",
+    )
+    schedule_status: str | None = Field(
+        default=None, examples=["open_hours"],
+        description="store_operating_status.schedule_status: 'open_hours' | 'closed_hours' | null(데이터 없음)",
+    )
+    power_status: str | None = Field(
+        default=None, examples=["active"],
+        description="store_operating_status.power_status: 'active' | 'low' | null(데이터 없음)",
+    )
+    final_status: str | None = Field(
+        default=None, examples=["영업중"],
+        description="'영업중' | '휴무추정' | '영업종료' | null(데이터 없음) - store_operating_status.final_status "
+                    "4값 중 '예외영업'은 '영업종료'로 단순화됨",
+    )
+    received_active_power_kwh: float | None = Field(
+        default=None, description="meter_timeseries.received_active_power_kwh(유효전력 kWh). 결측이거나 데이터 없으면 null"
+    )
+    biz_category_large: str | None = Field(default=None, examples=["음식"], description="stores.biz_category_large")
+    message: str | None = Field(
+        default=None, examples=[None],
+        description="해당 시각의 데이터가 저장되어 있지 않을 때만 안내 문구가 채워짐(그 외 null)",
+    )
+
+
+class StoreSnapshotGroup(BaseModel):
+    line_name: str = Field(examples=["A"])
+    stores: list[StoreSnapshotItem]
+
+
+class StoreSnapshotResponse(BaseModel):
+    count: int = Field(examples=[21])
+    date: str = Field(examples=["26-05-09"], description="입력값 그대로")
+    time: str = Field(examples=["19:15"], description="입력값 그대로(계기별 해상도 적용은 서버 내부에서 처리됨)")
+    items: list[StoreSnapshotGroup]
+
+
 class AnomalySchema(BaseModel):
     event_id: int
     meter_id: str = Field(examples=["A-L-71"])
