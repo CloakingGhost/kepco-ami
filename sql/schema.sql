@@ -148,20 +148,35 @@ CREATE TABLE IF NOT EXISTS store_operating_status (
 );
 CREATE INDEX IF NOT EXISTS idx_store_operating_status_ts ON store_operating_status (ts);
 
--- 6) 안전감지 이상치 이벤트 (2차 우선순위 기능)
+-- 6) 안전감지 위기 감지 이벤트 (2차 우선순위 기능)
 CREATE TABLE IF NOT EXISTS anomaly_events (
     event_id             BIGSERIAL PRIMARY KEY,
     meter_id               TEXT NOT NULL REFERENCES meters(meter_id) ON DELETE CASCADE,
-    detected_at              TIMESTAMP NOT NULL,          -- 이상치가 감지된 15분 슬롯의 ts
-    level                     TEXT NOT NULL CHECK (level IN ('주의', '위험')),
-    rule_triggered             TEXT NOT NULL,               -- 예: 'group_iqr_1.5x' / 'group_iqr_3x'
-        -- 시간대x요일 그룹별 median±IQR(또는 MAD) 배수 규칙 채택 이유:
-        -- 전역 정규분포 가정(z-score)은 4개 대표 계기 전부에서 기각됐고(정규성 p<<0.05),
-        -- 전역 IQR은 저사용/저변동 계기에서 미세한 변동까지 전부 이상치로 잡는 함정이 실측으로 확인됨
-        -- (visualize_analyis_data/docs/05_시각분석_AI방법론_보고서.md 4-1절, 4-3절 A-L-37 사례 근거)
+    detected_at              TIMESTAMP NOT NULL,          -- 감지된 15분 슬롯의 ts
+    level                     TEXT NOT NULL CHECK (level IN ('일반', '주의', '위험')),
+        -- 안전 등급 3단계. 의미:
+        --   일반 = 평상시(아무 규칙에도 걸리지 않은 상태)
+        --   주의 = 아직 사고는 아니지만 사고가 나기에 충분한 조건 - 점검/관리 대상
+        --   위험 = 실제로 전기사고가 발생한(발생 중인) 상황 - 즉시 조치 대상
+        -- *** '일반'은 CHECK에는 있지만 이 테이블에 행으로 저장되지 않는다. ***
+        -- 이 테이블은 "사건 기록부"라서 아무 일도 없었다는 사실까지 15분마다 적으면
+        -- 21개 매장 x 4개월이 27만행 전부 '일반'으로 채워질 뿐 정보량이 0이다.
+        -- 그래서 저장은 주의/위험만 하고, 조회 시 해당 슬롯에 행이 없으면 '일반'으로
+        -- 해석한다(ami_db.serving의 안전 등급 조회 로직이 이 규칙을 구현한다).
+        -- CHECK에 값을 남겨두는 이유는 3단계라는 도메인 어휘를 스키마에 명시하고,
+        -- 나중에 "점검했고 정상이었다"를 명시적으로 기록할 필요가 생기면 바로 쓰기 위함.
+    rule_triggered             TEXT NOT NULL,
+        -- 어떤 규칙이 발동했는지. 값과 근거는 db/src/ami_db/anomaly.py 모듈 docstring 참고:
+        --   'kec212_overload_145pct_60min'    (위험) 계약전력 145%가 60분 지속 - KEC 212
+        --   'continuous_load_80pct_180min'    (주의) 계약전력 80%가 3시간 지속 - 연속부하 80% 규칙
+        --   'pattern_deviation_3iqr_50pct_60min' (주의) 매장 자신의 패턴에서 3xIQR 이탈 +
+        --                                      계약전력 50% 이상이 60분 지속
+        -- 세 규칙 전부 "계약전력 대비 절대 비율 + 지속시간"의 쌍으로 정의된다. 통계적
+        -- 이상치(Tukey 등)를 그대로 등급에 매핑하지 않는 이유는 anomaly.py docstring 참고
+        -- (실측 3개월에서 위험 4,111건이 나와 "50분에 한 번 전기사고"라는 결론이 됐었음).
     metric_value               DOUBLE PRECISION NOT NULL,   -- 실제 관측된 recv_kWh
-    threshold_value              DOUBLE PRECISION NOT NULL,   -- 해당 (요일x시간대) 그룹의 임계치
-    notified_at                   TIMESTAMPTZ,                 -- 문자 발송 연동은 이번 범위 밖. 컬럼만 준비해두고 항상 NULL이어도 무방
+    threshold_value              DOUBLE PRECISION NOT NULL,   -- 그 규칙이 넘어섰다고 판정한 임계치(kWh)
+    notified_at                   TIMESTAMPTZ,                 -- 알림 발송 연동은 이번 범위 밖. 항상 NULL이어도 무방
     created_at                     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_anomaly_events_meter_detected ON anomaly_events (meter_id, detected_at);

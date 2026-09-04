@@ -2,13 +2,15 @@
 """
 2-7단계(2차 우선순위): anomaly_events 배치 계산/적재.
 
-임계치(group_iqr_1.5x=주의, group_iqr_3x=위험)의 최종 계수는 이번 범위에서
-확정하지 않고 문서화만 한다(계획서 '후속 논의' 항목) - 실제 안전감지 기능
-구현 시 팀이 조정할 여지를 남겨둔다.
+판정 규칙 3종(위험 1개, 주의 2개)과 그 전기설비 기준 근거는 전부
+ami_db.anomaly 모듈 docstring에 정리돼 있다. 요약하면:
+  - 위험 = 계약전력 145%가 60분 지속(KEC 212) - 이미 사고 조건에 진입
+  - 주의 = 계약전력 80%가 3시간 지속(연속부하 80% 규칙) 또는
+           매장 자신의 패턴에서 3xIQR 이탈 + 계약전력 50% 이상이 60분 지속
 
 "영업종료 이후" 개념(data/프로젝트개요.md)을 구현하기 위해, 09단계에서 이미
 계산해 둔 store_operating_status.schedule_status='closed_hours'인 슬롯만
-이상치 후보로 본다 - 영업시간 중 반짝 스파이크는 "혼잡"이지 안전 이슈가 아니다.
+판정 대상으로 본다.
 """
 import sys
 from pathlib import Path
@@ -17,12 +19,9 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ami_db.anomaly import compute_group_thresholds, flag_anomalies  # noqa: E402
+from ami_db.anomaly import compute_group_thresholds, detect_events  # noqa: E402
 from ami_db.config import GENERATED_DIR, VIZ_OUTPUT, settings  # noqa: E402
 from ami_db.db import bulk_insert, get_raw_connection  # noqa: E402
-
-ATTENTION_MULT = 1.5
-DANGER_MULT = 3.0
 
 
 def main() -> None:
@@ -33,6 +32,13 @@ def main() -> None:
 
     total = 0
     with get_raw_connection() as conn:
+        # 세 규칙 전부 매장마다 다른 contract_power_kw를 기준으로 삼는다 - 전 매장에
+        # 같은 절대 kWh 컷을 쓰면 그 자체로 "전역 컷"이 되어, 이 프로젝트가
+        # congestion_level에서 이미 피해 온 함정을 안전감지에서 반복하게 된다.
+        with conn.cursor() as cur:
+            cur.execute("SELECT meter_id, contract_power_kw FROM meters WHERE meter_id = ANY(%s)", (meter_ids,))
+            contract_power_by_meter = dict(cur.fetchall())
+
         # anomaly_events는 event_id가 SERIAL PK라 자연 유니크 제약(ON CONFLICT 대상)이
         # 없다. 재실행 시 중복 적재되지 않도록 이번 스코프(매칭된 21개 계기)의 기존
         # 이벤트를 먼저 지우고 다시 계산한다(멱등성 보장, 이 서브프로젝트 다른 로더들과
@@ -45,6 +51,7 @@ def main() -> None:
             if real_ts.empty:
                 continue
             thresholds = compute_group_thresholds(real_ts)
+            contract_power_kw = contract_power_by_meter.get(meter_id)
 
             with conn.cursor() as cur:
                 cur.execute(
@@ -62,8 +69,9 @@ def main() -> None:
             if closed_hours_ts.empty:
                 continue
 
-            flagged = flag_anomalies(closed_hours_ts, thresholds, ATTENTION_MULT, DANGER_MULT)
-            flagged = flagged[flagged["level"].notna()]
+            flagged = detect_events(closed_hours_ts, thresholds, contract_power_kw)
+            if flagged.empty:
+                continue
 
             rows = [
                 (meter_id, r.ts, r.level, r.rule_triggered, float(r.recv_kWh), float(r.threshold_value), None)
@@ -75,8 +83,8 @@ def main() -> None:
                 rows,
             )
             total += n
-            if n:
-                print(f"  {meter_id}: {n}건 감지")
+            counts = flagged["level"].value_counts().to_dict()
+            print(f"  {meter_id}: {n}건 (위험 {counts.get('위험', 0)} / 주의 {counts.get('주의', 0)})")
 
     print(f"\nanomaly_events 적재 총 {total}건")
 

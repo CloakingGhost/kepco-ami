@@ -125,6 +125,36 @@ def inject_mock_anomaly(
     return day_df
 
 
+def inject_sustained_load_scenario(
+    day_df: pd.DataFrame, contract_power_kw: float, start_slot: int, duration_slots: int,
+    load_ratio: float, rng: np.random.Generator,
+) -> pd.DataFrame:
+    """
+    [start_slot, start_slot+duration_slots) 구간을 "계약전력의 load_ratio배"에 해당하는
+    전력(±약한 노이즈)으로 채운다. load_ratio=1.45면 계약전력의 145%를 그 구간 내내
+    쓰고 있는 상태가 된다.
+
+    ami_db.anomaly의 지속시간 기반 규칙(위험=145%/60분, 주의=80%/3시간)이 실제로
+    발동하는지 검증하기 위한 함수다. inject_mock_anomaly()(슬롯 1개만 스파이크)는
+    "몇 시간 지속"이라는 조건 자체를 재현할 수 없어 이 목적엔 쓸 수 없다.
+
+    **호출부는 감지 임계치가 아니라 "실제로 주입할 부하 수준"을 load_ratio로 준다.**
+    감지 임계치에 딱 맞춰 주입하면 노이즈 때문에 일부 슬롯이 임계치 아래로 떨어져
+    "N슬롯 연속" 조건이 통째로 깨지는 것을 실측으로 확인했다(sustained_mask는 구간 내
+    모든 슬롯이 조건을 만족해야 발동한다). 그래서 임계치에서 충분히 떨어진 값을
+    주도록 호출부에 맡기고, 노이즈는 1.5%로 작게 유지한다. 실제 과부하도 트립
+    포인트에 정확히 걸쳐 있기보다 그보다 뚜렷하게 높은 채로 지속되는 게 일반적이라
+    이쪽이 더 현실적이기도 하다.
+    """
+    day_df = day_df.copy()
+    target_kwh = contract_power_kw * load_ratio / 4
+    mask = (day_df["slot"] >= start_slot) & (day_df["slot"] < start_slot + duration_slots)
+    noise_scale = max(target_kwh * 0.015, 0.01)
+    noisy = target_kwh + rng.normal(0, noise_scale, size=int(mask.sum()))
+    day_df.loc[mask, "recv_kWh"] = np.maximum(0.0, noisy)
+    return day_df
+
+
 @dataclass
 class ScenarioPick:
     meter_id: str

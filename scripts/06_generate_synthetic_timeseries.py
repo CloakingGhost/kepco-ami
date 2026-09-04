@@ -24,9 +24,42 @@ from ami_db.synthetic import (  # noqa: E402
     compute_night_baseline,
     inject_closure_scenario,
     inject_mock_anomaly,
+    inject_sustained_load_scenario,
     select_scenarios,
     synthesize_day,
 )
+
+# 합성 구간 상한. date.today()가 아니라 2026-07-31 고정이다 - 서비스가 조회를 허용하는
+# 범위(ami_db.serving.LATEST_SERVICE_DATE)와 정확히 일치시켜야, "조회는 되는데 데이터가
+# 없는 날짜"나 반대로 "데이터는 있는데 조회가 막힌 날짜"가 생기지 않는다.
+SYNTHETIC_END_DATE = date(2026, 7, 31)
+
+# 안전감지 데모 시나리오.
+# 실측 3개월(04-01~06-30)에는 위험 등급 상황이 실제로 0건이다(ami_db.anomaly 모듈
+# docstring의 실측 검증 참고) - 실제로 전기사고가 없었으니 그게 정답이다. 그래서 감지
+# 로직이 동작하는 걸 보여주려면 7월 합성 구간에 위험/주의 상황을 의도적으로 심어야 한다.
+# 06의 자동 시나리오 선정(select_scenarios) 및 그 공유 rng와는 무관한 별도 rng로 주입해
+# 나머지 매장의 합성값에는 일절 영향을 주지 않는다.
+#
+# load_ratio는 "감지 임계치"가 아니라 "실제로 주입할 부하 수준"이다 - 임계치에 딱 맞춰
+# 주입하면 노이즈로 일부 슬롯이 미달돼 지속 조건이 깨진다(inject_sustained_load_scenario
+# docstring 참고). 그래서 임계치(1.45 / 0.80)에서 충분히 떨어뜨려 잡았다.
+MANUAL_SCENARIOS = [
+    {
+        "meter_id": "A-L-60", "date": date(2026, 7, 2),   # 목요일, 영업 11:00~22:00
+        "start_slot": 8, "duration_slots": 4,              # 02:00~02:45 = 60분
+        "load_ratio": 1.70,                                # 위험 임계 145% 초과
+        "kind": "danger_overload",
+        "detail": "계약전력 170%를 60분 지속 - KEC212 위험(사고 발생) 조건",
+    },
+    {
+        "meter_id": "A-L-65", "date": date(2026, 7, 15),  # 수요일, 00:00~03:00 폐점 확인됨
+        "start_slot": 0, "duration_slots": 12,             # 00:00~02:45 = 3시간
+        "load_ratio": 0.95,                                # 연속부하 80% 초과, 위험 145% 미만
+        "kind": "continuous_load",
+        "detail": "계약전력 95%를 3시간 지속 - 연속부하 80% 규칙 초과(사고 충분조건)",
+    },
+]
 
 
 def main() -> None:
@@ -51,6 +84,13 @@ def main() -> None:
         with conn.cursor() as cur:
             cur.execute("SELECT meter_id, data_resolution FROM meters WHERE meter_id = ANY(%s)", (meter_ids,))
             resolution_by_meter = dict(cur.fetchall())
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT meter_id, contract_power_kw FROM meters WHERE meter_id = ANY(%s)",
+                ([s["meter_id"] for s in MANUAL_SCENARIOS],),
+            )
+            manual_contract_kw = dict(cur.fetchall())
 
     ratios_by_meter: dict[str, dict[int, tuple]] = {}
     meter_meta_by_meter: dict[str, dict] = {}  # 감사 리포트용 - biz_mid/biz_large/cohort_ids
@@ -86,11 +126,15 @@ def main() -> None:
     # 전 계기 공통으로 쓸 합성 날짜 범위: (모든 매칭 계기 중 실측이 가장 늦게 끝난 날짜) + 1일 ~ 오늘.
     # 가장 늦은 날짜를 기준으로 잡아야 어떤 계기도 실측 구간과 합성 구간이 겹치지 않는다.
     last_real_date = ts_all.groupby("meter_id")["time"].max().dt.date.max()
-    today = date.today()
-    synthetic_dates = [last_real_date + timedelta(days=i) for i in range(1, (today - last_real_date).days + 1)]
-    print(f"[2/5] 합성 날짜 범위: {synthetic_dates[0] if synthetic_dates else '없음'} ~ {today} ({len(synthetic_dates)}일)")
+    synthetic_dates = [
+        last_real_date + timedelta(days=i)
+        for i in range(1, (SYNTHETIC_END_DATE - last_real_date).days + 1)
+    ]
+    print(f"[2/5] 합성 날짜 범위: {synthetic_dates[0] if synthetic_dates else '없음'} ~ "
+          f"{SYNTHETIC_END_DATE} ({len(synthetic_dates)}일)")
 
     rng = np.random.default_rng(settings.rng_seed)
+    manual_rng = np.random.default_rng(20260702)  # 공유 rng와 완전히 분리 - 다른 계기 데이터 불변 보장
     scenarios = select_scenarios(meter_ids, synthetic_dates, effective_hours_by_meter, rng)
     scenario_by_key = {(s.meter_id, s.target_date): s for s in scenarios}
     print(f"[3/5] 시나리오 선정: 휴업 {sum(1 for s in scenarios if s.kind=='closure')}건, "
@@ -127,6 +171,17 @@ def main() -> None:
                 scenario_log_rows.append({
                     "meter_id": meter_id, "date": d, "kind": scenario.kind,
                     "slot": scenario.slot, "detail": scenario.detail,
+                })
+            for sc in MANUAL_SCENARIOS:
+                cp = manual_contract_kw.get(sc["meter_id"])
+                if meter_id != sc["meter_id"] or d != sc["date"] or not cp:
+                    continue
+                day_df = inject_sustained_load_scenario(
+                    day_df, cp, sc["start_slot"], sc["duration_slots"], sc["load_ratio"], manual_rng,
+                )
+                scenario_log_rows.append({
+                    "meter_id": meter_id, "date": d, "kind": sc["kind"], "slot": sc["start_slot"],
+                    "detail": f"{sc['detail']} (계약전력 {cp}kW, 수동 주입)",
                 })
             day_df["meter_id"] = meter_id
             # 재분배 적용 계기(A-L-58)는 15/30/45분 슬롯(정각이 아닌 슬롯)이 코호트 비율로
