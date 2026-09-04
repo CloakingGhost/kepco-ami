@@ -194,13 +194,64 @@ def refresh_store_places_cache(
         print(f'  ⚠️  지역 검증 실패 - "{place_info.name}" 주소="{address}" ("{REQUIRED_ADDRESS_SUBSTRING}" 미포함, 폐기)')
         return False
 
+    save_verified_place(conn, store_id, place_id, place_info, raw or {})
+    return True
+
+
+def save_verified_place(conn, store_id: int, place_id, place_info, raw: dict) -> None:
+    """
+    이미 검증까지 끝난(지역/이름 등) place_info를 google_places_cache + (운영시간이
+    있으면) store_operating_hours에 적재한다. refresh_store_places_cache()의 저장
+    부분을 그대로 추출한 것 - scripts/12_rematch_verified_stores.py처럼 후보를 여러 개
+    시도하며 이름 유사도까지 직접 검증하는 호출부가, 이미 손에 쥔 place_info/raw를
+    또 API 호출 없이 그대로 저장하려고 별도로 노출해뒀다.
+    """
     lines = place_info.hours.get_formatted_hours()
     _save_places_cache(
         conn, store_id, place_id, place_info.name, lines, place_info.open_now,
-        place_info.business_status, place_info.business_status_label, raw or {},
+        place_info.business_status, place_info.business_status_label, raw,
     )
-
     if not is_no_info(lines):
         _upsert_google_hours(conn, store_id, parse_places_hours_lines(lines))
 
-    return True
+
+def name_similarity(a: str, b: str) -> float:
+    """
+    두 상호명 문자열의 유사도(0~1). 공백을 지우고 비교한다(예: "25센치 꼬치앤오뎅바"
+    vs "25센치꼬치앤오뎅바" 같은 공백 표기 차이가 실측으로 흔했음). difflib만 쓰는
+    이유: 형태소 분석기 없이 표준 라이브러리만으로 "완전히 다른 상호"(예: "마티니" vs
+    "피티하모니 강서구청점")와 "표기만 다른 같은 상호"를 어느 정도 구분하기에 충분하고,
+    이 프로젝트가 이미 유사한 근사치 규칙(예: KSIC 완전일치)을 쓰는 것과 일관된 수준의
+    엄밀함이면 됨 - 완벽한 개체명 매칭기가 필요한 게 아니라 "완전히 동떨어진 결과"만
+    걸러내면 충분하기 때문.
+
+    포함관계 shortcut에 최소 길이/비율 조건을 건 이유(실측 버그 수정): "늘봄"(2글자)이
+    "강서늘봄동물병원"(8글자) 안에 우연히 부분 문자열로 들어있다는 이유만으로 예전
+    코드가 유사도 1.0을 줘서, 완전히 다른 업체(동물병원)를 같은 상호로 오인했다
+    (scripts/15 실행 결과 검수에서 발견됨). 이제 짧은쪽 문자열이 3글자 이상이고
+    긴쪽의 40% 이상을 차지할 때만 포함관계를 "확실한 매칭"으로 인정하고, 그 외에는
+    SequenceMatcher 비율로 넘겨서 우연의 부분 일치가 낮은 점수를 받게 한다.
+    """
+    from difflib import SequenceMatcher
+
+    norm_a = a.replace(" ", "")
+    norm_b = b.replace(" ", "")
+    if not norm_a or not norm_b:
+        return 0.0
+    shorter, longer = (norm_a, norm_b) if len(norm_a) <= len(norm_b) else (norm_b, norm_a)
+    if shorter in longer and len(shorter) >= 3 and len(shorter) / len(longer) >= 0.4:
+        return 1.0
+    return SequenceMatcher(None, norm_a, norm_b).ratio()
+
+
+# Google이 찾아준 이름에 이 키워드가 들어있으면 이름/지역 검증을 통과했어도 무조건
+# 거부한다. 병원/의원류는 KSIC가 우연히 맞아도(예: 75919 "기타 사업지원 서비스업"에
+# "늘봄" 같은 후보가 있다가 검색에서 완전히 무관한 "강서늘봄동물병원"으로 대체된 사례)
+# 전력 요구량이 소상공인 골목상권 데모의 스케일(계기 전부 <50kW)과 근본적으로
+# 안 맞는 업종이라 애초에 후보군에서 배제하는 게 맞다 - 이름 유사도 점수와 무관하게
+# 업종 성격 자체가 이 데모(음식/소매/개인서비스 등 소규모 상가)와 어긋난다.
+IMPLAUSIBLE_NAME_KEYWORDS = ["병원", "의원", "한의원", "약국"]
+
+
+def is_implausible_business(name: str) -> bool:
+    return any(kw in name for kw in IMPLAUSIBLE_NAME_KEYWORDS)

@@ -3,7 +3,7 @@
 > 이 문서는 `scripts/generate_api_docs.py`가 FastAPI OpenAPI 스키마에서 **자동 생성**했습니다.
 > 코드(엔드포인트·모델)를 고쳤다면 재생성하세요: `uv run python scripts/generate_api_docs.py`
 >
-> 버전: `0.1.0` · 생성 시각: `2026-09-03 17:07 UTC`
+> 버전: `0.1.0` · 생성 시각: `2026-09-03 23:10 UTC`
 
 **Base URL(로컬)**: `http://localhost:8000`  (Swagger UI: `http://localhost:8000/docs`)
 
@@ -81,7 +81,6 @@ store_id가 1~21 범위를 벗어나면 404.
 | 필드 | 타입 | 설명 |
 |---|---|---|
 | `rating` | `number \| null` | google_places_cache 최신 행의 raw_response_json.rating. Google Places 정보가 없으면 null |
-| `congestion_level` | `integer` | 혼잡도 코드. 0=해당없음(영업중이 아니거나 현재 상태 데이터 없음) | 1=하 | 2=중 | 3=상 |
 | `name` | `string` | stores.name |
 | `formatted_phone_number` | `string \| null` | raw_response_json.formatted_phone_number. 010 등 휴대폰 번호인 경우도 있음. 정보 없으면 null |
 | `road_address` | `string` | stores.road_address |

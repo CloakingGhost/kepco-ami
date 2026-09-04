@@ -323,9 +323,9 @@ def get_store_detail(engine: Engine, store_id: int) -> dict | None:
     google_places_cache는 fetched_at 최신 1행만 쓴다 - scripts/11_refresh_google_places.py가
     실행될 때마다 새 행이 쌓이는 insert-only 테이블이므로(과거 응답 이력 보존이 목적).
 
-    congestion_level은 스냅샷 API(get_stores_snapshot)와 동일하게 CONGESTION_LEVEL_CODE로
-    정수 인코딩하고, final_status는 FINAL_STATUS_SIMPLE_MAP으로 3값 단순화한다 - 두
-    "일반 사용자" 대상 API의 응답 규칙을 일치시키기 위함.
+    final_status는 FINAL_STATUS_SIMPLE_MAP으로 3값 단순화한다(스냅샷 API와 동일한 규칙).
+    congestion_level은 매장 상세 화면과는 무관하다고 판단해 응답에 포함하지 않는다
+    (혼잡도는 지도/목록형 화면(get_stores_snapshot)의 관심사).
 
     반환값 구분: store_id 자체가 stores에 없으면 None(호출부가 404로 매핑) - 다른
     조회 함수들과 동일한 패턴. Google 정보나 현재 상태 데이터가 없는 건 404가 아니라
@@ -342,7 +342,7 @@ def get_store_detail(engine: Engine, store_id: int) -> dict | None:
         status_row = conn.execute(
             text(
                 """
-                SELECT schedule_status, power_status, final_status, congestion_level
+                SELECT schedule_status, power_status, final_status
                 FROM store_operating_status
                 WHERE store_id = :store_id AND ts <= now()
                 ORDER BY ts DESC
@@ -392,7 +392,6 @@ def get_store_detail(engine: Engine, store_id: int) -> dict | None:
     if status_row is None:
         messages.append("현재 영업상태 데이터가 없습니다")
 
-    congestion_level = status_row["congestion_level"] if status_row else None
     final_status = FINAL_STATUS_SIMPLE_MAP.get(status_row["final_status"]) if status_row else None
     rating = places_row["rating"] if places_row else None
 
