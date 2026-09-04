@@ -119,6 +119,26 @@ class DaySeriesResult:
         return self.rows[0]["is_synthetic"]
 
 
+def _day_series_cutoff(target_date: date, until_time: time | None) -> datetime:
+    """
+    day-series 조회(get_meter_day_series/get_store_status_day)용 컷오프 시각.
+
+    until_time이 있으면 그대로 target_date에 붙여서 쓴다. 없으면 실제 벽시계의
+    "시:분"만 떼어 target_date에 붙인다 - service_now()를 통째로 쓰면 안 되는 이유는,
+    service_now()의 날짜는 (LATEST_SERVICE_DATE까지 투영되긴 해도) target_date와
+    다른 경우가 대부분이라 "ts <= cutoff" 비교에서 cutoff의 날짜 부분이 target_date
+    보다 미래이기만 하면 그 날짜의 모든 슬롯이 무조건 통과해버리기 때문이다(과거
+    날짜를 시간 없이 조회하면 "현재시간" 이후 미래 슬롯까지 하루 전체가 새어나가는
+    버그로 실제 보고됨 - 프론트 상세 팝업의 "시간대별 매장 활동량 추이" 차트가
+    선택한 시각 이후 구간까지 다 그려버림). 시:분만 떼어 쓰면 어떤 target_date를
+    조회하든 "그 날짜의 00:00부터, 지금이 몇 시몇분이든 그 시:분까지만"으로 항상
+    동일하게 좁혀진다.
+    """
+    if until_time is not None:
+        return datetime.combine(target_date, until_time)
+    return datetime.combine(target_date, service_now().time())
+
+
 def get_meter_day_series(
     engine: Engine, meter_id: str, target_date: date, until_time: time | None = None
 ) -> DaySeriesResult:
@@ -127,8 +147,9 @@ def get_meter_day_series(
 
     기준 시각 이후(미래) 슬롯은 반환하지 않는다 - 프론트 차트가 "현재시간" 세로선
     오른쪽까지 선을 그려버리는 문제가 보고돼서 서버에서 잘라 보낸다. 기준 시각은
-    until_time을 주면 그 시각, 안 주면 service_now()다(과거 날짜를 조회하면
-    service_now()가 그날 23:45보다 뒤라 자연히 하루 전체가 나온다 - 별도 분기 불필요).
+    until_time을 주면 그 시각, 안 주면 실제 벽시계의 시:분을 target_date에 붙인
+    시각이다(_day_series_cutoff 참고 - target_date가 오늘이 아니어도 하루 전체가
+    새지 않도록 날짜가 아니라 시:분만 가져온다).
 
     congestion_level은 문자열이 아니라 정수 코드로 넣는다(CONGESTION_LEVEL_CODE):
     0=해당없음(영업중이 아니거나 판정 없음) | 1=하 | 2=중 | 3=상. 프론트가 이 값을
@@ -138,7 +159,7 @@ def get_meter_day_series(
         raise ValueError(
             f"target_date는 {EARLIEST_SAMPLE_DATE} ~ {LATEST_SERVICE_DATE} 범위여야 합니다 (입력: {target_date})"
         )
-    cutoff = datetime.combine(target_date, until_time) if until_time is not None else service_now()
+    cutoff = _day_series_cutoff(target_date, until_time)
 
     query = text(
         """
@@ -265,7 +286,7 @@ def parse_snapshot_time(time_str: str) -> time:
     """스냅샷 조회용 시각 파싱. 'HH:MM'(00:00~23:45, 15분 단위)만 허용한다."""
     if not _SNAPSHOT_TIME_RE.match(time_str):
         raise ValueError(
-            f"time은 'HH:MM' 형식이며 분은 00/15/30/45 중 하나여야 합니다 (입력: {time_str!r}, 예: '19:15')"
+            f"time은 'HH:MM' 형식이며 분은 00/15/30/45 중 하나여야 합니다 (입력: {time_str!r}, 예: '09:15')"
         )
     hour_str, minute_str = time_str.split(":")
     return time(int(hour_str), int(minute_str))
@@ -547,6 +568,10 @@ def get_store_status_day(
     자체를 생략(insert 안 함)하므로 rows 길이가 96보다 짧을 수 있다 - 매장당 1개 값으로
     data_resolution을 같이 반환해 호출부(프론트)가 "빈 슬롯=결측 gap"임을 미리 알 수 있게 한다.
 
+    until_time 이후(미래) 슬롯은 반환하지 않는다. until_time을 안 주면 실제 벽시계의
+    시:분만 target_date에 붙여서 컷오프로 쓴다(_day_series_cutoff 참고) - target_date가
+    오늘이 아닌 과거/미래 날짜여도 하루 전체가 새지 않고 항상 00:00~그 시:분까지만 나온다.
+
     반환값 구분: store_id 자체가 stores에 없으면 None(호출부가 404로 매핑) - get_store_hours()와
     동일한 패턴. 매장은 있는데 그 날짜 행이 0개면 빈 리스트([])가 든 DayStatusResult - 존재하지
     않는 매장과 데이터가 없는 매장을 구분해야 404/200(빈 배열)을 정확히 가를 수 있다.
@@ -555,7 +580,7 @@ def get_store_status_day(
         raise ValueError(
             f"target_date는 {EARLIEST_SAMPLE_DATE} ~ {LATEST_SERVICE_DATE} 범위여야 합니다 (입력: {target_date})"
         )
-    cutoff = datetime.combine(target_date, until_time) if until_time is not None else service_now()
+    cutoff = _day_series_cutoff(target_date, until_time)
     query = text(
         """
         SELECT sos.ts, sos.schedule_status, sos.power_status, sos.final_status, sos.congestion_level,

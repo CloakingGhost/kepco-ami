@@ -128,9 +128,20 @@ class TestStoreHours:
 # ============================================================
 
 class TestStoreStatusDay:
+    """
+    time을 안 주면 더 이상 하루 전체가 나오지 않는다(회귀 방지 - ami_db.serving의
+    _day_series_cutoff 참고: time 생략 시 컷오프는 "실제 벽시계의 시:분을 date에
+    붙인 시각"이라 date가 오늘이 아니면 테스트 실행 시각에 따라 행 수가 들쭉날쭉해진다).
+    그래서 하루 전체(96행)를 보려는 테스트는 time="23:45"를 명시해 마지막 슬롯까지
+    받도록 고정한다.
+    """
+
     def test_normal_real_segment(self, client):
-        """정상(실측 구간): store_id=1, date=2026-05-15 -> 200, 96행, is_synthetic 전부 false."""
-        resp = client.get(f"/api/stores/{VALID_STORE_ID}/status", params={"date": REAL_DATE.isoformat()})
+        """정상(실측 구간): store_id=1, date=2026-05-15, time=23:45 -> 200, 96행, is_synthetic 전부 false."""
+        resp = client.get(
+            f"/api/stores/{VALID_STORE_ID}/status",
+            params={"date": REAL_DATE.isoformat(), "time": "23:45"},
+        )
         assert resp.status_code == 200
         body = resp.json()
         assert body["store_id"] == VALID_STORE_ID
@@ -141,8 +152,11 @@ class TestStoreStatusDay:
         assert all(r["is_synthetic"] is False for r in rows)
 
     def test_normal_synthetic_segment(self, client):
-        """정상(합성 구간): store_id=1, date=2026-08-15 -> 200, 96행, is_synthetic 전부 true."""
-        resp = client.get(f"/api/stores/{VALID_STORE_ID}/status", params={"date": SYNTHETIC_DATE.isoformat()})
+        """정상(합성 구간): store_id=1, date=2026-08-15, time=23:45 -> 200, 96행, is_synthetic 전부 true."""
+        resp = client.get(
+            f"/api/stores/{VALID_STORE_ID}/status",
+            params={"date": SYNTHETIC_DATE.isoformat(), "time": "23:45"},
+        )
         assert resp.status_code == 200
         body = resp.json()
         assert body["data_resolution"] == "15min"
@@ -151,12 +165,33 @@ class TestStoreStatusDay:
         assert all(r["is_synthetic"] is True for r in rows)
 
     def test_normal_1hour_resolution_store_has_fewer_rows(self, client):
-        """정상(1hour 계기 매장): store_id=2, date=2026-08-15 -> 200, data_resolution='1hour', rows<96."""
-        resp = client.get(f"/api/stores/{ONE_HOUR_STORE_ID}/status", params={"date": SYNTHETIC_DATE.isoformat()})
+        """정상(1hour 계기 매장): store_id=2, date=2026-08-15, time=23:45 -> 200, data_resolution='1hour', rows<96."""
+        resp = client.get(
+            f"/api/stores/{ONE_HOUR_STORE_ID}/status",
+            params={"date": SYNTHETIC_DATE.isoformat(), "time": "23:45"},
+        )
         assert resp.status_code == 200
         body = resp.json()
         assert body["data_resolution"] == "1hour"
         assert 0 < len(body["rows"]) < 96
+
+    def test_normal_no_time_never_leaks_past_current_time_of_day(self, client):
+        """
+        회귀 방지: time을 생략하면(과거 날짜를 조회해도) 실제 벽시계 시:분 이후
+        슬롯은 응답에 없어야 한다 - 예전엔 date가 오늘이 아니면 컷오프가 사실상
+        무제한이 되어 미래(그날 기준 "현재시간" 이후) 슬롯까지 하루 전체가
+        새어나가는 버그가 있었다(프론트 상세 팝업의 시간대별 활동량 차트가
+        선택 시각 이후 구간까지 그려버림).
+        """
+        from ami_db.serving import service_now
+
+        resp = client.get(f"/api/stores/{VALID_STORE_ID}/status", params={"date": REAL_DATE.isoformat()})
+        assert resp.status_code == 200
+        rows = resp.json()["rows"]
+        cutoff_time_str = service_now().strftime("%H:%M")
+        assert all(r["ts"][11:16] <= cutoff_time_str for r in rows), (
+            f"컷오프({cutoff_time_str}) 이후 슬롯이 응답에 포함됨 - 하루 전체 leak 회귀"
+        )
 
     def test_boundary_nonexistent_store_id_returns_404(self, client):
         """
