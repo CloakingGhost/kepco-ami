@@ -3,11 +3,11 @@
 > 이 문서는 `scripts/generate_api_docs.py`가 FastAPI OpenAPI 스키마에서 **자동 생성**했습니다.
 > 코드(엔드포인트·모델)를 고쳤다면 재생성하세요: `uv run python scripts/generate_api_docs.py`
 >
-> 버전: `0.1.0` · 생성 시각: `2026-09-03 23:10 UTC`
+> 버전: `0.1.0` · 생성 시각: `2026-09-04 07:28 UTC`
 
 **Base URL(로컬)**: `http://localhost:8000`  (Swagger UI: `http://localhost:8000/docs`)
 
-화곡동 파일럿 21개 매장의 영업유무/혼잡도/이상치를 조회하는 API. 데이터는 db/scripts/00~10 배치가 미리 계산해 PostgreSQL에 적재해 둔 것을 그대로 읽기만 한다. 조회 가능 날짜 범위: 2026-04-01 ~ 오늘.
+화곡동 파일럿 21개 매장의 영업유무/혼잡도/이상치를 조회하는 API. 데이터는 db/scripts/00~10 배치가 미리 계산해 PostgreSQL에 적재해 둔 것을 그대로 읽기만 한다. 조회 가능 날짜 범위: 2026-04-01 ~ 2026-07-31 (2026-06-30까지는 실측, 7월은 안전감지 데모용 합성 구간).
 
 ## 목차
 - [기본](#기본)
@@ -70,11 +70,15 @@ store_id를 body로 받는다(GET 경로에 store_id를 노출하지 않으려�
 현재 상태 데이터가 없으면 해당 필드는 null이 되고 message에 안내 문구가 채워진다
 (매장 자체는 존재하므로 404가 아니라 200으로 응답).
 
-congestion_level은 정수 코드로 내려온다: 0=해당없음(영업중이 아니거나 데이터 없음)
-| 1=하 | 2=중 | 3=상. final_status는 내부 4값 중 '예외영업'을 '영업종료'로 접어
-영업중/휴무추정/영업종료 3값으로만 내려준다.
+final_status는 내부 4값 중 '예외영업'을 '영업종료'로 접어 영업중/휴무추정/영업종료
+3값으로만 내려준다.
 
-store_id가 1~21 범위를 벗어나면 404.
+**기준 시각**: body에 date/time을 같이 주면 그 시점 기준으로 영업상태를 판정한다.
+목록(`/api/stores/snapshot`)에서 사용자가 고른 날짜·시각을 그대로 넘기면 목록과
+상세가 항상 같은 상태를 보여준다(안 넘기면 서버의 현재 시각 기준이라 목록이
+과거 시각을 보고 있을 때 둘이 어긋난다).
+
+store_id가 1~21 범위를 벗어나면 404, date/time 형식이 잘못되면 400.
 
 **응답 (200)** — `StoreDetailResponse`
 
@@ -153,8 +157,8 @@ date/time 형식이 잘못됐거나 date가 조회 가능 범위를 벗어나면
 
 | 이름 | 위치 | 타입 | 필수 | 예시 | 설명 |
 |---|---|---|:---:|---|---|
-| `date` | query | `string` | O | 26-05-09 | 조회할 날짜, 'YY-MM-DD' 형식(연도 2자리). 범위: 26-04-01 ~ 26-06-30 (AMI 샘플데이터 실측 구간). |
-| `time` | query | `string` | O | 19:15 | 조회할 시각, 'HH:MM' 형식(00:00~23:45, 15분 단위만 허용: 00/15/30/45). |
+| `date` | query | `string` |  |  | 조회할 날짜, 'YY-MM-DD' 형식(연도 2자리). 범위: 26-04-01 ~ 26-06-30 (AMI 샘플데이터 실측 구간). |
+| `time` | query | `string` |  |  | 조회할 시각, 'HH:MM' 형식(00:00~23:45, 15분 단위만 허용: 00/15/30/45). |
 
 **응답 (200)** — `StoreSnapshotResponse`
 
@@ -179,29 +183,44 @@ date/time 형식이 잘못됐거나 date가 조회 가능 범위를 벗어나면
 ## 안전감지
 
 ### `GET /api/anomalies`
-**이상치 이벤트 목록 (관리자 화면용)**
+**위기 감지 이벤트 목록 (관리자 화면용)**
 
-예시: `/api/anomalies?level=위험&limit=10` -> 위험 등급 최신 10건.
-파라미터를 하나도 안 주면(`/api/anomalies`) 전체 계기의 최신 이상치 200건이 반환된다.
-각 행에 매장명(store_name)까지 조인되어 있어 계기번호를 몰라도 바로 알아볼 수 있다.
-안전감지는 "영업종료 이후"에만 판정한다(영업시간 중 스파이크는 혼잡도 문제일 뿐 안전 이슈가 아니라고
-봄 - data/프로젝트개요.md 안전감지 항목 참고).
+기본값 그대로 실행하면 전체 기간(2026-04-01\~2026-07-31)의 최신 50건이 반환된다.
+
+**안전 등급 3단계**: `일반`(평상시) / `주의`(사고가 나기에 충분한 조건 - 점검 필요) /
+`위험`(실제 사고 발생 - 즉시 조치). `일반`은 "아무 규칙에도 안 걸린 상태"라 이벤트로
+저장되지 않으므로, 이 목록에는 `주의`와 `위험`만 나온다. 특정 슬롯에 이벤트가 없으면
+그 슬롯은 `일반`으로 해석하면 된다.
+
+**페이징**: 응답의 `total`이 필터 조건에 걸리는 전체 건수다. 다음 페이지는
+`offset`을 `limit`만큼 늘려서 다시 호출한다(예: `?limit=50&offset=50`).
+`offset >= total`이면 빈 배열이 온다.
+
+**판정 범위**: "영업종료 이후"(closed_hours)에만 판정한다 - 영업시간 중 전력이 높은 건
+혼잡도(`congestion_level`)가 설명할 몫이지 안전 이슈가 아니라고 본다
+(data/프로젝트개요.md 안전감지 항목).
+
+판정 규칙과 그 전기설비 기준 근거(KEC 212 등)는 `db/docs/안전감지_이상치_판정기준.md` 참고.
 
 **파라미터**
 
 | 이름 | 위치 | 타입 | 필수 | 예시 | 설명 |
 |---|---|---|:---:|---|---|
-| `level` | query | `string` |  | 위험 | 심각도 필터. 비우면 전체. |
-| `meter_id` | query | `string` |  | A-L-71 | 특정 계기만 조회하고 싶을 때. |
-| `since` | query | `string` |  | 2026-08-01 | 이 날짜 이후(포함)만 조회. |
-| `until` | query | `string` |  | 2026-09-01 | 이 날짜 이전(포함)까지만 조회. |
-| `limit` | query | `integer` |  | 50 | 최대 반환 건수(최신순). |
+| `level` | query | `string` |  |  | 안전 등급 필터. 비우면 주의+위험 전부. 평상시('일반')는 이벤트로 저장되지 않으므로 이 목록에 나오지 않는다. |
+| `meter_id` | query | `string` |  |  | 특정 계기만 조회. 비우면 21개 매장 전체. |
+| `since` | query | `string` |  |  | 조회 시작일(포함). 데이터 범위: 2026-04-01 ~ 2026-07-31. |
+| `until` | query | `string` |  |  | 조회 종료일(그날 23:59:59까지 포함). 데이터 범위: 2026-04-01 ~ 2026-07-31. |
+| `limit` | query | `integer` |  |  | 한 페이지에 반환할 최대 건수. |
+| `offset` | query | `integer` |  |  | 건너뛸 건수. 다음 페이지는 offset += limit. |
 
 **응답 (200)** — `AnomalyListResponse`
 
 | 필드 | 타입 | 설명 |
 |---|---|---|
-| `anomalies` | `AnomalySchema[]` |  |
+| `total` | `integer` | 필터 조건에 걸리는 전체 건수(이번 페이지 건수가 아님). 페이지 수 = ceil(total / limit). |
+| `limit` | `integer` | 이번 요청의 페이지 크기 |
+| `offset` | `integer` | 이번 요청이 건너뛴 건수 |
+| `anomalies` | `AnomalySchema[]` | 이번 페이지의 이벤트(최신순) |
 
 <details><summary><code>AnomalySchema</code> 필드 상세</summary>
 
@@ -211,11 +230,11 @@ date/time 형식이 잘못됐거나 date가 조회 가능 범위를 벗어나면
 | `meter_id` | `string` |  |
 | `store_name` | `string \| null` |  |
 | `detected_at` | `string` |  |
-| `level` | `string` | '주의' | '위험' |
-| `rule_triggered` | `string` |  |
-| `metric_value` | `number` | 실제 관측된 유효전력(kWh) |
-| `threshold_value` | `number` | 이 값을 넘으면 해당 level로 판정된 임계치 |
-| `notified_at` | `string \| null` | 문자 발송 연동은 이번 범위 밖이라 항상 null |
+| `level` | `string` | 안전 등급. '주의'(사고가 나기에 충분한 조건 - 점검 필요) | '위험'(실제 사고 발생 - 즉시 조치). 아무 규칙에도 안 걸린 평상시는 '일반'이며, 이벤트 자체가 생성되지 않으므로 이 목록에는 나오지 않는다. |
+| `rule_triggered` | `string` | 발동한 규칙. 'kec212_overload_145pct_60min'(위험: 계약전력 145%가 60분 지속) | 'continuous_load_80pct_180min'(주의: 계약전력 80%가 3시간 지속) | 'pattern_deviation_3iqr_50pct_60min'(주의: 매장 자신의 패턴에서 3xIQR 이탈 + 계약전력 50% 이상이 60분 지속). 근거는 db/docs/안전감지_이상치_판정기준.md 참고. |
+| `metric_value` | `number` | 실제 관측된 유효전력(kWh, 15분 슬롯 값) |
+| `threshold_value` | `number` | 그 규칙이 넘어섰다고 판정한 임계치(kWh, 15분 슬롯 값) |
+| `notified_at` | `string \| null` | 알림 발송 연동은 이번 범위 밖이라 항상 null |
 
 </details>
 
@@ -226,15 +245,16 @@ date/time 형식이 잘못됐거나 date가 조회 가능 범위를 벗어나면
 ### `GET /api/meters/{meter_id}/timeseries`
 **계기 1곳의 하루 원시 전력값**
 
-상태 판정 없이 15분 단위 전력값(kWh)만 필요할 때 쓴다. 상태+전력을 같이 보려면
-`/api/stores/{store_id}/status`를 대신 쓰는 게 낫다(이 엔드포인트는 순수 원시값용).
+15분 단위 전력값(kWh) + 각 슬롯의 혼잡도(정수 0~3)/영업상태를 반환한다 - 차트를
+이 한 번의 호출로 그릴 수 있게 하기 위함. 기준 시각 이후 슬롯은 잘라서 보낸다.
 
 **파라미터**
 
 | 이름 | 위치 | 타입 | 필수 | 예시 | 설명 |
 |---|---|---|:---:|---|---|
 | `meter_id` | path | `string` | O | A-L-11 | 계기번호(예: 'A-L-11') |
-| `date` | query | `string` | O | 2026-05-15, 2026-08-15 | 조회할 날짜 |
+| `date` | query | `string` |  |  | 조회할 날짜 (2026-04-01 ~ 2026-07-31). 2026-06-30까지 실측, 7월은 합성 구간. |
+| `time` | query | `string` |  |  | 기준 시각 'HH:MM'(15분 단위). 이 시각 이후(미래) 슬롯은 응답에서 제외한다. 생략하면 서버의 현재 시각 기준으로 자른다(과거 날짜면 하루 전체가 나옴). |
 
 **응답 (200)** — `MeterTimeseriesResponse`
 
@@ -252,6 +272,8 @@ date/time 형식이 잘못됐거나 date가 조회 가능 범위를 벗어나면
 |---|---|---|
 | `ts` | `string` |  |
 | `received_active_power_kwh` | `number \| null` |  |
+| `congestion_level` | `integer` | 혼잡도 코드. 0=해당없음(영업중이 아니거나 판정 없음) | 1=여유 | 2=보통 | 3=혼잡. 차트에 그대로 시리즈로 그릴 수 있도록 문자열이 아닌 정수로 내려간다. |
+| `final_status` | `string \| null` | '영업중' | '휴무추정' | '영업종료' | null(판정 없음) |
 | `is_synthetic` | `boolean` |  |
 | `is_redistributed` | `boolean` | true면 실제 15분 단위 실측이 아니라 코호트 비율로 추정한 값(DayStatusRow.is_redistributed와 동일 의미) |
 
@@ -269,7 +291,8 @@ meter_timeseries와 동일하나 store_id(상가 기준)로 조회한다.
 | 이름 | 위치 | 타입 | 필수 | 예시 | 설명 |
 |---|---|---|:---:|---|---|
 | `store_id` | path | `integer` | O | 1 | 상가 ID (1~21) |
-| `date` | query | `string` | O | 2026-05-15, 2026-08-15 | 조회할 날짜 |
+| `date` | query | `string` |  |  | 조회할 날짜 (2026-04-01 ~ 2026-07-31). 2026-06-30까지 실측, 7월은 합성 구간. |
+| `time` | query | `string` |  |  | 기준 시각 'HH:MM'(15분 단위). 이 시각 이후(미래) 슬롯은 응답에서 제외한다. 생략하면 서버의 현재 시각 기준으로 자른다(과거 날짜면 하루 전체가 나옴). |
 
 **응답 (200)** — `StoreTimeseriesResponse`
 
@@ -288,6 +311,8 @@ meter_timeseries와 동일하나 store_id(상가 기준)로 조회한다.
 |---|---|---|
 | `ts` | `string` |  |
 | `received_active_power_kwh` | `number \| null` |  |
+| `congestion_level` | `integer` | 혼잡도 코드. 0=해당없음(영업중이 아니거나 판정 없음) | 1=여유 | 2=보통 | 3=혼잡. 차트에 그대로 시리즈로 그릴 수 있도록 문자열이 아닌 정수로 내려간다. |
+| `final_status` | `string \| null` | '영업중' | '휴무추정' | '영업종료' | null(판정 없음) |
 | `is_synthetic` | `boolean` |  |
 | `is_redistributed` | `boolean` | true면 실제 15분 단위 실측이 아니라 코호트 비율로 추정한 값(DayStatusRow.is_redistributed와 동일 의미) |
 

@@ -30,6 +30,7 @@ from fastapi import FastAPI, HTTPException, Path as PathParam, Query  # noqa: E4
 from ami_db.db import get_engine  # noqa: E402
 from ami_db.serving import (  # noqa: E402
     EARLIEST_SAMPLE_DATE,
+    LATEST_SERVICE_DATE,
     LATEST_SNAPSHOT_DATE,
     get_all_stores,
     get_anomalies,
@@ -41,6 +42,7 @@ from ami_db.serving import (  # noqa: E402
     get_store_hours,
     get_store_status_day,
     get_stores_snapshot,
+    parse_snapshot_time,
 )
 from app.schemas import (  # noqa: E402
     AnomalyListResponse,
@@ -61,7 +63,8 @@ app = FastAPI(
     description=(
         "화곡동 파일럿 21개 매장의 영업유무/혼잡도/이상치를 조회하는 API. "
         "데이터는 db/scripts/00~10 배치가 미리 계산해 PostgreSQL에 적재해 둔 것을 그대로 읽기만 한다. "
-        f"조회 가능 날짜 범위: {EARLIEST_SAMPLE_DATE} ~ 오늘."
+        f"조회 가능 날짜 범위: {EARLIEST_SAMPLE_DATE} ~ {LATEST_SERVICE_DATE} "
+        f"(2026-06-30까지는 실측, 7월은 안전감지 데모용 합성 구간)."
     ),
     version="0.1.0",
 )
@@ -72,8 +75,9 @@ _engine = get_engine()
 EXAMPLE_STORE_ID = 1          # 못난이찹쌀꽈배기 - Google에 운영시간 정보 없어 ksic_estimate 폴백 케이스
 EXAMPLE_METER_ID = "A-L-11"   # 위 store_id=1과 동일 매장의 계기번호
 EXAMPLE_DATE_REAL = date(2026, 5, 15)       # 실측 구간 예시 날짜
-EXAMPLE_DATE_SYNTHETIC = date(2026, 8, 15)  # 합성 구간 예시 날짜
-EXAMPLE_ANOMALY_METER_ID = "A-L-71"         # 실제로 '위험' 이벤트가 존재하는 계기
+EXAMPLE_DATE_SYNTHETIC = date(2026, 7, 15)  # 합성 구간 예시 날짜(7월, 주의 시나리오가 심긴 날)
+EXAMPLE_DANGER_METER_ID = "A-L-60"          # 7월 '위험' 시나리오가 심긴 계기(충북식당)
+EXAMPLE_CAUTION_METER_ID = "A-L-65"         # 7월 '주의' 시나리오가 심긴 계기(와카츠)
 
 
 @app.get("/health", tags=["기본"], summary="헬스체크")
@@ -104,13 +108,20 @@ def store_detail(body: StoreDetailRequest):
     현재 상태 데이터가 없으면 해당 필드는 null이 되고 message에 안내 문구가 채워진다
     (매장 자체는 존재하므로 404가 아니라 200으로 응답).
 
-    congestion_level은 정수 코드로 내려온다: 0=해당없음(영업중이 아니거나 데이터 없음)
-    | 1=하 | 2=중 | 3=상. final_status는 내부 4값 중 '예외영업'을 '영업종료'로 접어
-    영업중/휴무추정/영업종료 3값으로만 내려준다.
+    final_status는 내부 4값 중 '예외영업'을 '영업종료'로 접어 영업중/휴무추정/영업종료
+    3값으로만 내려준다.
 
-    store_id가 1~21 범위를 벗어나면 404.
+    **기준 시각**: body에 date/time을 같이 주면 그 시점 기준으로 영업상태를 판정한다.
+    목록(`/api/stores/snapshot`)에서 사용자가 고른 날짜·시각을 그대로 넘기면 목록과
+    상세가 항상 같은 상태를 보여준다(안 넘기면 서버의 현재 시각 기준이라 목록이
+    과거 시각을 보고 있을 때 둘이 어긋난다).
+
+    store_id가 1~21 범위를 벗어나면 404, date/time 형식이 잘못되면 400.
     """
-    result = get_store_detail(_engine, body.store_id)
+    try:
+        result = get_store_detail(_engine, body.store_id, body.date, body.time)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     if result is None:
         raise HTTPException(
             status_code=404, detail=f"store_id={body.store_id}의 매장이 없습니다 (1~21 범위인지 확인하세요)"
@@ -137,16 +148,14 @@ def list_current_status():
 )
 def stores_snapshot(
     date: str = Query(
-        ...,
+        default="26-05-09",
         description=f"조회할 날짜, 'YY-MM-DD' 형식(연도 2자리). 범위: "
                     f"{EARLIEST_SAMPLE_DATE.strftime('%y-%m-%d')} ~ {LATEST_SNAPSHOT_DATE.strftime('%y-%m-%d')} "
                     f"(AMI 샘플데이터 실측 구간).",
-        examples=["26-05-09"],
     ),
     time: str = Query(
-        ...,
+        default="19:15",
         description="조회할 시각, 'HH:MM' 형식(00:00~23:45, 15분 단위만 허용: 00/15/30/45).",
-        examples=["19:15"],
     ),
 ):
     """
@@ -220,20 +229,25 @@ def store_hours(
 def store_status_day(
     store_id: int = PathParam(..., description="상가 ID (1~21)", examples=[EXAMPLE_STORE_ID]),
     date: date = Query(
-        ...,
+        default=EXAMPLE_DATE_REAL,
         description=f"조회할 날짜. {EARLIEST_SAMPLE_DATE}~2026-06-30은 실측, "
-                     f"2026-07-01~오늘은 합성 데이터(is_synthetic로 구분됨).",
-        examples=[EXAMPLE_DATE_REAL, EXAMPLE_DATE_SYNTHETIC],
+                     f"2026-07-01~{LATEST_SERVICE_DATE}는 합성 데이터(is_synthetic로 구분됨).",
+    ),
+    time: str | None = Query(
+        default=None,
+        description="기준 시각 'HH:MM'(15분 단위). 이 시각 이후(미래) 슬롯은 응답에서 제외한다. "
+                    "생략하면 서버의 현재 시각 기준으로 자른다.",
     ),
 ):
     """
-    예시: `/api/stores/1/status?date=2026-08-15` -> 96개(15분×24시간) 슬롯의
-    schedule_status/power_status/final_status/congestion_level + 실제 전력값(kWh).
-    data/images/user-메인-*.png의 "오늘 시간대별" 차트를 이 한 번의 호출로 그릴 수 있다.
-    store_id 범위를 벗어나면 404, date가 조회 가능 범위 밖이면 400.
+    예시: `/api/stores/1/status?date=2026-05-15` -> 15분 슬롯별
+    schedule_status/power_status/final_status/congestion_level(정수 0~3) + 전력값(kWh).
+    화면의 "시간대별 전력" 차트를 이 한 번의 호출로 그릴 수 있다. 기준 시각 이후
+    슬롯은 잘라서 보내므로 96개보다 적을 수 있다.
+    store_id 범위를 벗어나면 404, date/time이 조회 가능 범위 밖이면 400.
     """
     try:
-        result = get_store_status_day(_engine, store_id, date)
+        result = get_store_status_day(_engine, store_id, date, parse_snapshot_time(time) if time else None)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     if result is None:
@@ -247,28 +261,60 @@ def store_status_day(
 
 
 @app.get(
-    "/api/anomalies", tags=["안전감지"], summary="이상치 이벤트 목록 (관리자 화면용)",
+    "/api/anomalies", tags=["안전감지"], summary="위기 감지 이벤트 목록 (관리자 화면용)",
     response_model=AnomalyListResponse,
 )
 def list_anomalies(
     level: Literal["주의", "위험"] | None = Query(
-        default=None, description="심각도 필터. 비우면 전체.", examples=["위험"],
+        default=None,
+        description="안전 등급 필터. 비우면 주의+위험 전부. "
+                    "평상시('일반')는 이벤트로 저장되지 않으므로 이 목록에 나오지 않는다.",
+        openapi_examples={
+            "전체": {"summary": "필터 없음 (주의+위험 전부)", "value": None},
+            "위험만": {"summary": "실제 사고 발생 건만", "value": "위험"},
+            "주의만": {"summary": "사고 충분조건 건만", "value": "주의"},
+        },
     ),
     meter_id: str | None = Query(
-        default=None, description="특정 계기만 조회하고 싶을 때.", examples=[EXAMPLE_ANOMALY_METER_ID],
+        default=None,
+        description="특정 계기만 조회. 비우면 21개 매장 전체.",
+        openapi_examples={
+            "전체": {"summary": "필터 없음 (21개 매장 전체)", "value": None},
+            "위험 데모 계기": {"summary": f"{EXAMPLE_DANGER_METER_ID} (7월 위험 시나리오)", "value": EXAMPLE_DANGER_METER_ID},
+            "주의 데모 계기": {"summary": f"{EXAMPLE_CAUTION_METER_ID} (7월 주의 시나리오)", "value": EXAMPLE_CAUTION_METER_ID},
+        },
     ),
-    since: date | None = Query(default=None, description="이 날짜 이후(포함)만 조회.", examples=["2026-08-01"]),
-    until: date | None = Query(default=None, description="이 날짜 이전(포함)까지만 조회.", examples=["2026-09-01"]),
-    limit: int = Query(default=200, ge=1, le=2000, description="최대 반환 건수(최신순).", examples=[50]),
+    since: date = Query(
+        default=EARLIEST_SAMPLE_DATE,
+        description=f"조회 시작일(포함). 데이터 범위: {EARLIEST_SAMPLE_DATE} ~ {LATEST_SERVICE_DATE}.",
+    ),
+    until: date = Query(
+        default=LATEST_SERVICE_DATE,
+        description=f"조회 종료일(그날 23:59:59까지 포함). 데이터 범위: {EARLIEST_SAMPLE_DATE} ~ {LATEST_SERVICE_DATE}.",
+    ),
+    limit: int = Query(default=50, ge=1, le=500, description="한 페이지에 반환할 최대 건수."),
+    offset: int = Query(default=0, ge=0, description="건너뛸 건수. 다음 페이지는 offset += limit."),
 ):
     """
-    예시: `/api/anomalies?level=위험&limit=10` -> 위험 등급 최신 10건.
-    파라미터를 하나도 안 주면(`/api/anomalies`) 전체 계기의 최신 이상치 200건이 반환된다.
-    각 행에 매장명(store_name)까지 조인되어 있어 계기번호를 몰라도 바로 알아볼 수 있다.
-    안전감지는 "영업종료 이후"에만 판정한다(영업시간 중 스파이크는 혼잡도 문제일 뿐 안전 이슈가 아니라고
-    봄 - data/프로젝트개요.md 안전감지 항목 참고).
+    기본값 그대로 실행하면 전체 기간(2026-04-01\\~2026-07-31)의 최신 50건이 반환된다.
+
+    **안전 등급 3단계**: `일반`(평상시) / `주의`(사고가 나기에 충분한 조건 - 점검 필요) /
+    `위험`(실제 사고 발생 - 즉시 조치). `일반`은 "아무 규칙에도 안 걸린 상태"라 이벤트로
+    저장되지 않으므로, 이 목록에는 `주의`와 `위험`만 나온다. 특정 슬롯에 이벤트가 없으면
+    그 슬롯은 `일반`으로 해석하면 된다.
+
+    **페이징**: 응답의 `total`이 필터 조건에 걸리는 전체 건수다. 다음 페이지는
+    `offset`을 `limit`만큼 늘려서 다시 호출한다(예: `?limit=50&offset=50`).
+    `offset >= total`이면 빈 배열이 온다.
+
+    **판정 범위**: "영업종료 이후"(closed_hours)에만 판정한다 - 영업시간 중 전력이 높은 건
+    혼잡도(`congestion_level`)가 설명할 몫이지 안전 이슈가 아니라고 본다
+    (data/프로젝트개요.md 안전감지 항목).
+
+    판정 규칙과 그 전기설비 기준 근거(KEC 212 등)는 `db/docs/안전감지_이상치_판정기준.md` 참고.
     """
-    return {"anomalies": get_anomalies(_engine, level, meter_id, since, until, limit)}
+    rows, total = get_anomalies(_engine, level, meter_id, since, until, limit, offset)
+    return {"total": total, "limit": limit, "offset": offset, "anomalies": rows}
 
 
 @app.get(
@@ -277,14 +323,23 @@ def list_anomalies(
 )
 def meter_timeseries(
     meter_id: str = PathParam(..., description="계기번호(예: 'A-L-11')", examples=[EXAMPLE_METER_ID]),
-    date: date = Query(..., description="조회할 날짜", examples=[EXAMPLE_DATE_REAL, EXAMPLE_DATE_SYNTHETIC]),
+    date: date = Query(
+        default=EXAMPLE_DATE_REAL,
+        description=f"조회할 날짜 ({EARLIEST_SAMPLE_DATE} ~ {LATEST_SERVICE_DATE}). "
+                    f"2026-06-30까지 실측, 7월은 합성 구간.",
+    ),
+    time: str | None = Query(
+        default=None,
+        description="기준 시각 'HH:MM'(15분 단위). 이 시각 이후(미래) 슬롯은 응답에서 제외한다. "
+                    "생략하면 서버의 현재 시각 기준으로 자른다(과거 날짜면 하루 전체가 나옴).",
+    ),
 ):
     """
-    상태 판정 없이 15분 단위 전력값(kWh)만 필요할 때 쓴다. 상태+전력을 같이 보려면
-    `/api/stores/{store_id}/status`를 대신 쓰는 게 낫다(이 엔드포인트는 순수 원시값용).
+    15분 단위 전력값(kWh) + 각 슬롯의 혼잡도(정수 0~3)/영업상태를 반환한다 - 차트를
+    이 한 번의 호출로 그릴 수 있게 하기 위함. 기준 시각 이후 슬롯은 잘라서 보낸다.
     """
     try:
-        result = get_meter_day_series(_engine, meter_id, date)
+        result = get_meter_day_series(_engine, meter_id, date, parse_snapshot_time(time) if time else None)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {
@@ -302,11 +357,20 @@ def meter_timeseries(
 )
 def store_timeseries(
     store_id: int = PathParam(..., description="상가 ID (1~21)", examples=[EXAMPLE_STORE_ID]),
-    date: date = Query(..., description="조회할 날짜", examples=[EXAMPLE_DATE_REAL, EXAMPLE_DATE_SYNTHETIC]),
+    date: date = Query(
+        default=EXAMPLE_DATE_REAL,
+        description=f"조회할 날짜 ({EARLIEST_SAMPLE_DATE} ~ {LATEST_SERVICE_DATE}). "
+                    f"2026-06-30까지 실측, 7월은 합성 구간.",
+    ),
+    time: str | None = Query(
+        default=None,
+        description="기준 시각 'HH:MM'(15분 단위). 이 시각 이후(미래) 슬롯은 응답에서 제외한다. "
+                    "생략하면 서버의 현재 시각 기준으로 자른다(과거 날짜면 하루 전체가 나옴).",
+    ),
 ):
     """meter_timeseries와 동일하나 store_id(상가 기준)로 조회한다."""
     try:
-        result = get_store_day_series(_engine, store_id, date)
+        result = get_store_day_series(_engine, store_id, date, parse_snapshot_time(time) if time else None)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {

@@ -94,7 +94,15 @@ def compute_status_for_store(
         FINAL_STATUS_MATRIX[(s, p)] for s, p in zip(df["schedule_status"], df["power_status"])
     ]
 
-    q1, q3 = compute_utilization_quartiles(meter_ts.rename(columns={"recv_kWh": "recv_kWh"}), contract_power_kw)
+    # 사분위 기준선은 반드시 "영업중으로 판정된 슬롯"만으로 계산한다.
+    # 예전엔 하루 전체 슬롯(야간·휴무 포함)으로 Q1/Q3를 잡아놓고 판정은 영업중
+    # 슬롯에만 적용했는데, 영업중은 정의상 야간 baseline의 1.5배 이상이라 전체 기준
+    # Q1을 거의 항상 넘어버려 '하'(여유)가 사실상 나오지 않았다(실측: 상 58.2% /
+    # 중 41.7% / 하 0.1%(37건)). 예: store_id=12는 영업중 슬롯의 실제 Q1(20.1%)이
+    # 전체 기준 Q3(21.8%)에 육박해 구조적으로 '하'가 불가능했다. 같은 모집단(영업중)
+    # 안에서 사분위를 잡아야 하:중:상 = 25:50:25로 의미 있게 갈린다.
+    open_slots = df.loc[df["final_status"] == "영업중", ["recv_kWh"]]
+    q1, q3 = compute_utilization_quartiles(open_slots, contract_power_kw)
     util = (df["recv_kWh"].fillna(0) * 4) / contract_power_kw * 100 if contract_power_kw else pd.Series(0, index=df.index)
     congestion = np.select([util <= q1, util <= q3], ["하", "중"], default="상")
     df["congestion_level"] = np.where(df["final_status"] == "영업중", congestion, None)

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 
 import numpy as np
 import pandas as pd
@@ -18,15 +18,59 @@ from sqlalchemy import Engine, text
 
 EARLIEST_SAMPLE_DATE = date(2026, 4, 1)
 
-# 스냅샷 API(get_stores_snapshot) 전용 상한. meter_timeseries.is_synthetic 기준
-# 실측 구간은 2026-04-01~06-30까지고 그 이후(07-01~오늘)는 합성 데이터인데,
-# 이 엔드포인트는 "AMI 샘플데이터" 자체의 날짜 범위만 받기로 했으므로 다른
-# 엔드포인트(EARLIEST_SAMPLE_DATE~date.today())와 달리 상한을 실측 마지막 날짜로
-# 고정한다 - date.today()를 쓰지 않는다.
+# 스냅샷 API(get_stores_snapshot) 전용 상한. 이 엔드포인트는 "AMI 실측 샘플데이터"
+# 자체의 날짜 범위만 받기로 했으므로 합성 구간(07-01~)을 포함하지 않는다.
 LATEST_SNAPSHOT_DATE = date(2026, 6, 30)
+
+# 전체 서비스 조회 상한. date.today()를 쓰지 않는 이유:
+#   - 실측 데이터는 2026-06-30까지만 존재한다.
+#   - 7월은 안전감지(위기 감지) 데모를 위해 의도적으로 열어둔 합성 구간이다 - 실측
+#     3개월에는 '위험' 등급 상황이 실제로 0건이라(ami_db.anomaly 모듈 docstring의
+#     실측 검증 참고) 감지 로직이 동작하는 걸 보여줄 데이터가 없기 때문에, 7월에
+#     위험/주의 시나리오를 심어 그 구간으로 시연한다.
+#   - date.today()를 쓰면 실행일이 지날수록 "조회는 되는데 데이터가 없는 날짜"가
+#     계속 늘어난다(실제로 8~9월 구간이 그렇게 쌓였다). 생성 상한
+#     (06_generate_synthetic_timeseries.SYNTHETIC_END_DATE)과 같은 날짜로 못박아
+#     "조회 가능 = 데이터 존재"를 항상 참으로 유지한다.
+LATEST_SERVICE_DATE = date(2026, 7, 31)
 
 _SNAPSHOT_DATE_RE = re.compile(r"^\d{2}-\d{2}-\d{2}$")
 _SNAPSHOT_TIME_RE = re.compile(r"^([01]\d|2[0-3]):(00|15|30|45)$")
+
+
+def service_now() -> datetime:
+    """
+    "현재 시각"의 단일 정의. 실제 벽시계 시각이 데이터 마지막 날짜(LATEST_SERVICE_DATE)를
+    지났으면, 시:분은 그대로 두고 날짜만 마지막 날짜로 투영해서 돌려준다.
+
+    이유(실측 버그): 예전엔 SQL now()를 그대로 썼는데 데이터는 2026-07-31에서 끝나고
+    서버 날짜는 그 이후라, "ts <= now() 중 최신" 조회가 항상 마지막 행(07-31 23:45)만
+    집어왔다. 그 결과 상세 API의 "현재 상태"가 자정 직전 시각에 고정돼 늘 영업종료/
+    휴무추정으로 나왔고, 사용자가 고른 시각 기준으로 판정하는 목록(스냅샷) API와
+    상태가 엇갈렸다(프론트에서 "목록=휴무추정, 상세=영업종료" 불일치로 보고됨).
+    시:분을 살려 투영하면 데모 중에도 시간대에 따라 상태가 실제로 변한다.
+
+    15분 그리드에 맞춰 내림(floor)한다 - store_operating_status가 15분 단위라
+    그리드 밖 시각으로 조회해봐야 어차피 직전 슬롯이 잡히기 때문.
+    """
+    real = datetime.now()
+    ref = real if real.date() <= LATEST_SERVICE_DATE else datetime.combine(LATEST_SERVICE_DATE, real.time())
+    return ref.replace(minute=(ref.minute // 15) * 15, second=0, microsecond=0)
+
+
+def parse_service_date(date_str: str) -> date:
+    """parse_snapshot_date()와 형식은 같고(YY-MM-DD) 상한만 LATEST_SERVICE_DATE인 버전."""
+    if not _SNAPSHOT_DATE_RE.match(date_str):
+        raise ValueError(f"date는 'YY-MM-DD' 형식이어야 합니다 (입력: {date_str!r}, 예: '26-05-09')")
+    try:
+        parsed = datetime.strptime(date_str, "%y-%m-%d").date()
+    except ValueError as e:
+        raise ValueError(f"date를 파싱할 수 없습니다 (입력: {date_str!r}): {e}") from e
+    if parsed < EARLIEST_SAMPLE_DATE or parsed > LATEST_SERVICE_DATE:
+        raise ValueError(
+            f"date는 {EARLIEST_SAMPLE_DATE} ~ {LATEST_SERVICE_DATE} 범위여야 합니다 (입력: {parsed})"
+        )
+    return parsed
 
 # 09_compute_operating_status.py가 실제 계산해 채워두는 4가지 final_status 값 중
 # '예외영업'은 프로젝트 내부용 세부 판정값이다(db/docs/영업상태_혼잡도_판정기준.md
@@ -75,38 +119,63 @@ class DaySeriesResult:
         return self.rows[0]["is_synthetic"]
 
 
-def get_meter_day_series(engine: Engine, meter_id: str, target_date: date) -> DaySeriesResult:
-    if target_date < EARLIEST_SAMPLE_DATE or target_date > date.today():
+def get_meter_day_series(
+    engine: Engine, meter_id: str, target_date: date, until_time: time | None = None
+) -> DaySeriesResult:
+    """
+    하루치 15분 전력값 + 그 슬롯의 영업상태/혼잡도(차트용).
+
+    기준 시각 이후(미래) 슬롯은 반환하지 않는다 - 프론트 차트가 "현재시간" 세로선
+    오른쪽까지 선을 그려버리는 문제가 보고돼서 서버에서 잘라 보낸다. 기준 시각은
+    until_time을 주면 그 시각, 안 주면 service_now()다(과거 날짜를 조회하면
+    service_now()가 그날 23:45보다 뒤라 자연히 하루 전체가 나온다 - 별도 분기 불필요).
+
+    congestion_level은 문자열이 아니라 정수 코드로 넣는다(CONGESTION_LEVEL_CODE):
+    0=해당없음(영업중이 아니거나 판정 없음) | 1=하 | 2=중 | 3=상. 프론트가 이 값을
+    그대로 차트 시리즈로 그릴 수 있게 하기 위함이고, 스냅샷/상세 API의 인코딩과도 같다.
+    """
+    if target_date < EARLIEST_SAMPLE_DATE or target_date > LATEST_SERVICE_DATE:
         raise ValueError(
-            f"target_date는 {EARLIEST_SAMPLE_DATE} ~ {date.today()} 범위여야 합니다 (입력: {target_date})"
+            f"target_date는 {EARLIEST_SAMPLE_DATE} ~ {LATEST_SERVICE_DATE} 범위여야 합니다 (입력: {target_date})"
         )
+    cutoff = datetime.combine(target_date, until_time) if until_time is not None else service_now()
 
     query = text(
         """
-        SELECT mt.ts, mt.received_active_power_kwh, mt.is_synthetic, mt.is_redistributed
+        SELECT mt.ts, mt.received_active_power_kwh, mt.is_synthetic, mt.is_redistributed,
+               sos.final_status, sos.congestion_level
         FROM meter_timeseries mt
-        WHERE mt.meter_id = :meter_id AND mt.ts::date = :target_date
+        LEFT JOIN stores s ON s.meter_id = mt.meter_id
+        LEFT JOIN store_operating_status sos ON sos.store_id = s.store_id AND sos.ts = mt.ts
+        WHERE mt.meter_id = :meter_id AND mt.ts::date = :target_date AND mt.ts <= :cutoff
         ORDER BY mt.ts
         """
     )
     with engine.connect() as conn:
-        df = pd.read_sql(query, conn, params={"meter_id": meter_id, "target_date": target_date})
+        df = pd.read_sql(
+            query, conn, params={"meter_id": meter_id, "target_date": target_date, "cutoff": cutoff}
+        )
         data_resolution = conn.execute(
             text("SELECT data_resolution FROM meters WHERE meter_id = :meter_id"), {"meter_id": meter_id}
         ).scalar_one_or_none() or "15min"
 
     rows = _records(df)
+    for row in rows:
+        row["congestion_level"] = CONGESTION_LEVEL_CODE[row["congestion_level"]]
+        row["final_status"] = FINAL_STATUS_SIMPLE_MAP.get(row["final_status"]) if row["final_status"] else None
     return DaySeriesResult(meter_id=meter_id, target_date=target_date, rows=rows, data_resolution=data_resolution)
 
 
-def get_store_day_series(engine: Engine, store_id: int, target_date: date) -> DaySeriesResult:
+def get_store_day_series(
+    engine: Engine, store_id: int, target_date: date, until_time: time | None = None
+) -> DaySeriesResult:
     with engine.connect() as conn:
         meter_id = conn.execute(
             text("SELECT meter_id FROM stores WHERE store_id = :store_id"), {"store_id": store_id}
         ).scalar_one_or_none()
     if meter_id is None:
         raise ValueError(f"store_id={store_id}에 해당하는 상가가 없습니다")
-    return get_meter_day_series(engine, meter_id, target_date)
+    return get_meter_day_series(engine, meter_id, target_date, until_time)
 
 
 # ============================================================
@@ -137,8 +206,9 @@ def get_current_status_all(engine: Engine) -> list[dict]:
 
     store_operating_status는 15분 그리드로 미리 계산돼 있으므로, 매장별로
     "지금 시각 이하인 것 중 가장 최근 행"을 고르면 된다(DISTINCT ON으로 매장당
-    1행만 남김). ts <= now()로 제한하는 이유: 이 테이블은 오늘 23:45까지의
-    합성 데이터도 이미 갖고 있어서 제한이 없으면 "미래" 슬롯이 최신으로 잡힐 수 있다.
+    1행만 남김). 기준 시각은 SQL now()가 아니라 service_now()를 쓴다 - 이유는
+    service_now() docstring 참고(데이터 종료일 이후엔 now()가 항상 마지막 슬롯만
+    집어와 상세 API와 상태가 엇갈리는 버그가 있었음).
     """
     query = text(
         """
@@ -147,12 +217,12 @@ def get_current_status_all(engine: Engine) -> list[dict]:
                sos.ts, sos.schedule_status, sos.power_status, sos.final_status, sos.congestion_level
         FROM store_operating_status sos
         JOIN stores s ON s.store_id = sos.store_id
-        WHERE sos.ts <= now()
+        WHERE sos.ts <= :ref_ts
         ORDER BY sos.store_id, sos.ts DESC
         """
     )
     with engine.connect() as conn:
-        return _records(pd.read_sql(query, conn))
+        return _records(pd.read_sql(query, conn, params={"ref_ts": service_now()}))
 
 
 def get_current_status_one(engine: Engine, store_id: int) -> dict | None:
@@ -162,13 +232,13 @@ def get_current_status_one(engine: Engine, store_id: int) -> dict | None:
                sos.final_status, sos.congestion_level
         FROM store_operating_status sos
         JOIN stores s ON s.store_id = sos.store_id
-        WHERE sos.store_id = :store_id AND sos.ts <= now()
+        WHERE sos.store_id = :store_id AND sos.ts <= :ref_ts
         ORDER BY sos.ts DESC
         LIMIT 1
         """
     )
     with engine.connect() as conn:
-        df = pd.read_sql(query, conn, params={"store_id": store_id})
+        df = pd.read_sql(query, conn, params={"store_id": store_id, "ref_ts": service_now()})
     return _records(df)[0] if not df.empty else None
 
 
@@ -312,13 +382,23 @@ _WEEKDAY_KEYS = {
 }
 
 
-def get_store_detail(engine: Engine, store_id: int) -> dict | None:
+def get_store_detail(
+    engine: Engine, store_id: int, date_str: str | None = None, time_str: str | None = None
+) -> dict | None:
     """
     매장 1곳의 상세정보 - POST /api/stores(상세조회, body로 store_id를 받아 URL에
     노출하지 않음)가 쓴다. 평점/전화번호/웹사이트(google_places_cache 최신 1행) +
     요일별(월~일) 영업시간(store_operating_hours, google_places 우선/ksic_estimate
-    폴백) + 지금 이 순간의 영업상태/혼잡도(store_operating_status, get_current_status_one과
-    동일한 "ts<=now() 중 최신" 조회)를 한 번에 묶어 반환한다.
+    폴백) + 해당 시점의 영업상태를 한 번에 묶어 반환한다.
+
+    date_str/time_str(둘 다 주면)이 기준 시각이 된다 - 목록(스냅샷 API)에서 사용자가
+    고른 날짜·시각을 그대로 넘기라는 뜻이다. 안 주면 service_now()가 기준이다.
+    이 파라미터가 없던 시절엔 목록은 사용자가 고른 시각, 상세는 서버 now() 기준이라
+    "목록=휴무추정, 상세=영업종료"처럼 상태가 엇갈렸다(프론트에서 보고된 버그).
+
+    상태 조회는 "기준 시각 이하 중 가장 최근 슬롯"이다 - 15분 계기는 해당 슬롯이
+    그대로 잡히고, 1hour 계기(15/30/45분 슬롯이 없는 계기)는 자연스럽게 직전 정각
+    슬롯이 잡혀서 스냅샷 API의 해상도 처리와 같은 결과가 된다.
 
     google_places_cache는 fetched_at 최신 1행만 쓴다 - scripts/11_refresh_google_places.py가
     실행될 때마다 새 행이 쌓이는 insert-only 테이블이므로(과거 응답 이력 보존이 목적).
@@ -331,6 +411,11 @@ def get_store_detail(engine: Engine, store_id: int) -> dict | None:
     조회 함수들과 동일한 패턴. Google 정보나 현재 상태 데이터가 없는 건 404가 아니라
     해당 필드를 null로 두고 message에 안내 문구를 채워 표현한다(매장 자체는 존재하므로).
     """
+    if date_str is not None and time_str is not None:
+        ref_ts = datetime.combine(parse_service_date(date_str), parse_snapshot_time(time_str))
+    else:
+        ref_ts = service_now()
+
     with engine.connect() as conn:
         store_row = conn.execute(
             text("SELECT name, road_address, biz_category_large FROM stores WHERE store_id = :store_id"),
@@ -342,14 +427,14 @@ def get_store_detail(engine: Engine, store_id: int) -> dict | None:
         status_row = conn.execute(
             text(
                 """
-                SELECT schedule_status, power_status, final_status
+                SELECT ts, schedule_status, power_status, final_status
                 FROM store_operating_status
-                WHERE store_id = :store_id AND ts <= now()
+                WHERE store_id = :store_id AND ts <= :ref_ts
                 ORDER BY ts DESC
                 LIMIT 1
                 """
             ),
-            {"store_id": store_id},
+            {"store_id": store_id, "ref_ts": ref_ts},
         ).mappings().first()
 
         places_row = conn.execute(
@@ -450,7 +535,9 @@ class DayStatusResult:
     data_resolution: str = "15min"
 
 
-def get_store_status_day(engine: Engine, store_id: int, target_date: date) -> DayStatusResult | None:
+def get_store_status_day(
+    engine: Engine, store_id: int, target_date: date, until_time: time | None = None
+) -> DayStatusResult | None:
     """
     한 매장의 하루치 상태 타임라인(15분 단위) - 전력값(recv_kWh)까지 같이 조인해서
     반환한다. data/images/user-메인-*.png의 "오늘 시간대별 전력+상태" 뷰를 이 한 번의
@@ -464,10 +551,11 @@ def get_store_status_day(engine: Engine, store_id: int, target_date: date) -> Da
     동일한 패턴. 매장은 있는데 그 날짜 행이 0개면 빈 리스트([])가 든 DayStatusResult - 존재하지
     않는 매장과 데이터가 없는 매장을 구분해야 404/200(빈 배열)을 정확히 가를 수 있다.
     """
-    if target_date < EARLIEST_SAMPLE_DATE or target_date > date.today():
+    if target_date < EARLIEST_SAMPLE_DATE or target_date > LATEST_SERVICE_DATE:
         raise ValueError(
-            f"target_date는 {EARLIEST_SAMPLE_DATE} ~ {date.today()} 범위여야 합니다 (입력: {target_date})"
+            f"target_date는 {EARLIEST_SAMPLE_DATE} ~ {LATEST_SERVICE_DATE} 범위여야 합니다 (입력: {target_date})"
         )
+    cutoff = datetime.combine(target_date, until_time) if until_time is not None else service_now()
     query = text(
         """
         SELECT sos.ts, sos.schedule_status, sos.power_status, sos.final_status, sos.congestion_level,
@@ -475,7 +563,7 @@ def get_store_status_day(engine: Engine, store_id: int, target_date: date) -> Da
         FROM store_operating_status sos
         JOIN stores s ON s.store_id = sos.store_id
         JOIN meter_timeseries mt ON mt.meter_id = s.meter_id AND mt.ts = sos.ts
-        WHERE sos.store_id = :store_id AND sos.ts::date = :target_date
+        WHERE sos.store_id = :store_id AND sos.ts::date = :target_date AND sos.ts <= :cutoff
         ORDER BY sos.ts
         """
     )
@@ -486,7 +574,9 @@ def get_store_status_day(engine: Engine, store_id: int, target_date: date) -> Da
         if exists is None:
             return None
 
-        df = pd.read_sql(query, conn, params={"store_id": store_id, "target_date": target_date})
+        df = pd.read_sql(
+            query, conn, params={"store_id": store_id, "target_date": target_date, "cutoff": cutoff}
+        )
         data_resolution = conn.execute(
             text(
                 "SELECT m.data_resolution FROM stores s JOIN meters m ON m.meter_id = s.meter_id "
@@ -494,7 +584,11 @@ def get_store_status_day(engine: Engine, store_id: int, target_date: date) -> Da
             ),
             {"store_id": store_id},
         ).scalar_one_or_none() or "15min"
-    return DayStatusResult(store_id=store_id, target_date=target_date, rows=_records(df), data_resolution=data_resolution)
+    rows = _records(df)
+    for row in rows:
+        row["congestion_level"] = CONGESTION_LEVEL_CODE[row["congestion_level"]]
+        row["final_status"] = FINAL_STATUS_SIMPLE_MAP.get(row["final_status"]) if row["final_status"] else None
+    return DayStatusResult(store_id=store_id, target_date=target_date, rows=rows, data_resolution=data_resolution)
 
 
 def get_anomalies(
@@ -503,14 +597,27 @@ def get_anomalies(
     meter_id: str | None = None,
     since: date | None = None,
     until: date | None = None,
-    limit: int = 200,
-) -> list[dict]:
+    limit: int = 50,
+    offset: int = 0,
+) -> tuple[list[dict], int]:
     """
-    안전감지(관리자 화면)용 이상치 이벤트 목록. 상가 이름까지 조인해서 반환한다
+    안전감지(관리자 화면)용 위기 감지 이벤트 목록. 상가 이름까지 조인해서 반환한다
     (관리자가 계기번호보다 매장명으로 보는 게 자연스러움). 최신순 정렬.
+
+    반환: (이번 페이지 행 리스트, 필터 조건에 걸리는 전체 건수). 전체 건수를 같이
+    주는 이유는 프론트가 "몇 페이지까지 있는지"를 알아야 페이징 UI를 그릴 수 있기
+    때문이다 - 행만 주면 마지막 페이지인지 아닌지 알 수 없다.
+
+    since/until은 날짜(date)로 받지만 detected_at은 타임스탬프라, until은 "그 날짜
+    당일 23:59:59까지"로 해석해 하루 전체를 포함시킨다(until=2026-07-02로 조회하면
+    7월 2일 02:00 이벤트가 빠지는 문제가 있었다 - 날짜를 자정으로 캐스팅해 비교하면
+    그날 00:00:00만 걸리기 때문).
+
+    level='일반'은 이벤트가 없는 상태를 뜻하므로 anomaly_events에는 저장되지 않는다
+    (db/sql/schema.sql의 anomaly_events 주석 참고) - 이 필터로는 항상 0건이 나온다.
     """
     conditions: list[str] = []
-    params: dict = {"limit": limit}
+    params: dict = {"limit": limit, "offset": offset}
     if level is not None:
         conditions.append("ae.level = :level")
         params["level"] = level
@@ -521,10 +628,11 @@ def get_anomalies(
         conditions.append("ae.detected_at >= :since")
         params["since"] = since
     if until is not None:
-        conditions.append("ae.detected_at <= :until")
-        params["until"] = until
+        conditions.append("ae.detected_at < :until_exclusive")
+        params["until_exclusive"] = datetime.combine(until, time(0, 0)) + timedelta(days=1)
     where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
+    count_query = text(f"SELECT count(*) FROM anomaly_events ae {where_clause}")
     query = text(
         f"""
         SELECT ae.event_id, ae.meter_id, s.name AS store_name, ae.detected_at, ae.level,
@@ -532,10 +640,12 @@ def get_anomalies(
         FROM anomaly_events ae
         LEFT JOIN stores s ON s.meter_id = ae.meter_id
         {where_clause}
-        ORDER BY ae.detected_at DESC
-        LIMIT :limit
+        ORDER BY ae.detected_at DESC, ae.event_id DESC
+        LIMIT :limit OFFSET :offset
         """
     )
     with engine.connect() as conn:
+        count_params = {k: v for k, v in params.items() if k not in ("limit", "offset")}
+        total = int(conn.execute(count_query, count_params).scalar_one())
         df = pd.read_sql(query, conn, params=params)
-    return _records(df)
+    return _records(df), total

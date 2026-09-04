@@ -85,8 +85,10 @@ class DayStatusRow(BaseModel):
     ts: datetime
     schedule_status: str
     power_status: str
-    final_status: str
-    congestion_level: str | None = None
+    final_status: str = Field(description="'영업중' | '휴무추정' | '영업종료'('예외영업'은 '영업종료'로 단순화)")
+    congestion_level: int = Field(
+        examples=[2], description="혼잡도 코드. 0=해당없음 | 1=여유 | 2=보통 | 3=혼잡"
+    )
     received_active_power_kwh: float | None = Field(default=None, description="15분 유효전력(kWh). 결측이면 null")
     is_synthetic: bool = Field(description="false=실측(2026-04-01~06-30), true=합성(2026-07-01~오늘)")
     is_redistributed: bool = Field(
@@ -160,6 +162,16 @@ class StoreSnapshotResponse(BaseModel):
 
 class StoreDetailRequest(BaseModel):
     store_id: int = Field(examples=[1], description="상가 ID (1~21). body로 받는 이유는 URL에 store_id를 노출하지 않기 위함")
+    date: str | None = Field(
+        default=None, examples=["26-05-09"],
+        description="기준 날짜 'YY-MM-DD'. time과 함께 주면 그 시점 기준으로 영업상태를 판정한다 - "
+                    "목록(스냅샷 API)에서 사용자가 고른 날짜·시각을 그대로 넘기면 목록과 상세의 상태가 어긋나지 않는다. "
+                    "생략하면 서버의 현재 시각 기준.",
+    )
+    time: str | None = Field(
+        default=None, examples=["19:15"],
+        description="기준 시각 'HH:MM'(00:00~23:45, 15분 단위). date와 함께 사용한다.",
+    )
 
 
 class StoreDetailResponse(BaseModel):
@@ -199,23 +211,49 @@ class StoreDetailResponse(BaseModel):
 
 class AnomalySchema(BaseModel):
     event_id: int
-    meter_id: str = Field(examples=["A-L-71"])
-    store_name: str | None = Field(default=None, examples=["정들옛날치킨불닭발"])
+    meter_id: str = Field(examples=["A-L-60"])
+    store_name: str | None = Field(default=None, examples=["충북식당"])
     detected_at: datetime
-    level: str = Field(examples=["위험"], description="'주의' | '위험'")
-    rule_triggered: str = Field(examples=["group_iqr_3.0x"])
-    metric_value: float = Field(description="실제 관측된 유효전력(kWh)")
-    threshold_value: float = Field(description="이 값을 넘으면 해당 level로 판정된 임계치")
-    notified_at: datetime | None = Field(default=None, description="문자 발송 연동은 이번 범위 밖이라 항상 null")
+    level: str = Field(
+        examples=["위험"],
+        description="안전 등급. '주의'(사고가 나기에 충분한 조건 - 점검 필요) | "
+                    "'위험'(실제 사고 발생 - 즉시 조치). 아무 규칙에도 안 걸린 평상시는 "
+                    "'일반'이며, 이벤트 자체가 생성되지 않으므로 이 목록에는 나오지 않는다.",
+    )
+    rule_triggered: str = Field(
+        examples=["kec212_overload_145pct_60min"],
+        description="발동한 규칙. 'kec212_overload_145pct_60min'(위험: 계약전력 145%가 60분 지속) | "
+                    "'continuous_load_80pct_180min'(주의: 계약전력 80%가 3시간 지속) | "
+                    "'pattern_deviation_3iqr_50pct_60min'(주의: 매장 자신의 패턴에서 3xIQR 이탈 + "
+                    "계약전력 50% 이상이 60분 지속). 근거는 db/docs/안전감지_이상치_판정기준.md 참고.",
+    )
+    metric_value: float = Field(description="실제 관측된 유효전력(kWh, 15분 슬롯 값)")
+    threshold_value: float = Field(description="그 규칙이 넘어섰다고 판정한 임계치(kWh, 15분 슬롯 값)")
+    notified_at: datetime | None = Field(default=None, description="알림 발송 연동은 이번 범위 밖이라 항상 null")
 
 
 class AnomalyListResponse(BaseModel):
-    anomalies: list[AnomalySchema]
+    total: int = Field(
+        examples=[26],
+        description="필터 조건에 걸리는 전체 건수(이번 페이지 건수가 아님). "
+                    "페이지 수 = ceil(total / limit).",
+    )
+    limit: int = Field(examples=[50], description="이번 요청의 페이지 크기")
+    offset: int = Field(examples=[0], description="이번 요청이 건너뛴 건수")
+    anomalies: list[AnomalySchema] = Field(description="이번 페이지의 이벤트(최신순)")
 
 
 class TimeseriesRow(BaseModel):
     ts: datetime
     received_active_power_kwh: float | None = None
+    congestion_level: int = Field(
+        examples=[2],
+        description="혼잡도 코드. 0=해당없음(영업중이 아니거나 판정 없음) | 1=여유 | 2=보통 | 3=혼잡. "
+                    "차트에 그대로 시리즈로 그릴 수 있도록 문자열이 아닌 정수로 내려간다.",
+    )
+    final_status: str | None = Field(
+        default=None, examples=["영업중"], description="'영업중' | '휴무추정' | '영업종료' | null(판정 없음)"
+    )
     is_synthetic: bool
     is_redistributed: bool = Field(
         description="true면 실제 15분 단위 실측이 아니라 코호트 비율로 추정한 값(DayStatusRow.is_redistributed와 동일 의미)"

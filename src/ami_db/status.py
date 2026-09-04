@@ -98,6 +98,11 @@ def compute_utilization_quartiles(meter_ts: pd.DataFrame, contract_power_kw: flo
     (03_visual_analysis.py의 이용률 계산식과 동일: max_kWh*4/수전전력*100)
     Q1/Q3를 상/중/하 혼잡도 구간 경계로 쓴다(05_시각분석_AI방법론_보고서.md 4-4절:
     소규모·저압 그룹의 이용률 분산이 크다는 실측 근거 - 계기별 상대 기준이 필요).
+
+    ★ meter_ts에는 "영업중으로 판정된 슬롯만" 넘겨야 한다. 혼잡도는 영업중일 때만
+    부여되므로, 기준선도 같은 모집단에서 잡아야 하:중:상이 25:50:25로 갈린다.
+    하루 전체(야간·휴무 포함)를 넘기면 영업중 슬롯이 대부분 상위 구간에 몰려
+    '하'가 거의 사라진다(실측 버그 이력은 09_compute_operating_status.py 주석 참고).
     """
     if not contract_power_kw or contract_power_kw <= 0:
         return 0.0, 0.0

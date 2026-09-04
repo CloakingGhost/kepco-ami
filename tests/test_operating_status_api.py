@@ -8,28 +8,30 @@
 
 시나리오 표는 db/tests/README에 두지 않고(요청받지 않았으므로) 이 파일의 각 테스트
 docstring/이름에 그대로 옮겨 적는다. 화곡동 파일럿 21개 매장(match_status='matched')만
-유효 대상이고, 조회 가능 날짜는 EARLIEST_SAMPLE_DATE(2026-04-01)~오늘이다.
+유효 대상이고, 조회 가능 날짜는 EARLIEST_SAMPLE_DATE(2026-04-01)~LATEST_SERVICE_DATE
+(2026-07-31)이다 - 상한이 date.today()가 아니라 고정 날짜인 이유는
+ami_db/serving.py의 LATEST_SERVICE_DATE 주석 참고.
 
 날짜 선택 근거:
   - REAL_DATE(2026-05-15)는 app/serving_api.py의 EXAMPLE_DATE_REAL과 동일값 - 실측
     구간(is_synthetic=false)의 "가장자리가 아닌" 날짜라 store_id=1이 정확히 96행
     (15분 x 24시간)을 갖는다 (2026-04-01처럼 그리드 첫날은 0시 슬롯이 비어 95행이 되는
     엣지케이스가 있어 정상 케이스로는 부적합해서 피했다).
-  - SYNTHETIC_DATE(2026-08-15)도 EXAMPLE_DATE_SYNTHETIC과 동일 - 합성 구간
+  - SYNTHETIC_DATE(2026-07-15)도 EXAMPLE_DATE_SYNTHETIC과 동일 - 합성 구간
     (is_synthetic=true) 대표 날짜.
 """
 from __future__ import annotations
 
 from datetime import date, timedelta
 
-from ami_db.serving import EARLIEST_SAMPLE_DATE
+from ami_db.serving import EARLIEST_SAMPLE_DATE, LATEST_SERVICE_DATE
 
 VALID_STORE_ID = 1  # 못난이찹쌀꽈배기 - google_places 없어 ksic_estimate 폴백 케이스 (data/serving_api.py EXAMPLE_STORE_ID와 동일)
 ONE_HOUR_STORE_ID = 2  # meters.data_resolution='1hour'인 계기(A-L-16)를 쓰는 매장
 NONEXISTENT_STORE_ID = 999  # 21개 매장 범위(1~21) 밖 - stores 테이블에 존재하지 않음
 
 REAL_DATE = date(2026, 5, 15)        # 실측 구간, 그리드 가장자리 아님(96행)
-SYNTHETIC_DATE = date(2026, 8, 15)   # 합성 구간, 그리드 가장자리 아님(96행)
+SYNTHETIC_DATE = date(2026, 7, 15)   # 합성 구간, 그리드 가장자리 아님(96행)
 
 
 # ============================================================
@@ -179,25 +181,29 @@ class TestStoreStatusDay:
         resp = client.get(f"/api/stores/{VALID_STORE_ID}/status", params={"date": before.isoformat()})
         assert resp.status_code == 400
 
-    def test_boundary_date_after_today_returns_400(self, client):
-        """경계: 오늘 이후 날짜(내일) -> 400."""
-        tomorrow = date.today() + timedelta(days=1)
-        resp = client.get(f"/api/stores/{VALID_STORE_ID}/status", params={"date": tomorrow.isoformat()})
+    def test_boundary_date_after_service_range_returns_400(self, client):
+        """경계: LATEST_SERVICE_DATE(2026-07-31) 다음날 -> 400."""
+        after = LATEST_SERVICE_DATE + timedelta(days=1)
+        resp = client.get(f"/api/stores/{VALID_STORE_ID}/status", params={"date": after.isoformat()})
         assert resp.status_code == 400
 
-    def test_boundary_date_equal_to_today_is_valid(self, client):
-        """경계: 오늘 날짜 자체(범위의 상한, inclusive) -> 200."""
-        today = date.today()
-        resp = client.get(f"/api/stores/{VALID_STORE_ID}/status", params={"date": today.isoformat()})
+    def test_boundary_date_equal_to_service_end_is_valid(self, client):
+        """경계: LATEST_SERVICE_DATE 자체(범위의 상한, inclusive) -> 200."""
+        resp = client.get(
+            f"/api/stores/{VALID_STORE_ID}/status", params={"date": LATEST_SERVICE_DATE.isoformat()}
+        )
         assert resp.status_code == 200
         body = resp.json()
-        assert body["date"] == today.isoformat()
+        assert body["date"] == LATEST_SERVICE_DATE.isoformat()
         assert isinstance(body["rows"], list)
 
-    def test_schema_congestion_level_null_iff_not_operating(self, client):
+    def test_schema_congestion_level_zero_iff_not_operating(self, client):
         """
-        스키마 검증: 모든 행에서 congestion_level이 not null <=> final_status=='영업중'
-        (schema.sql의 CHECK 제약과 API 응답이 일치해야 한다).
+        스키마 검증: congestion_level이 1~3 <=> final_status=='영업중', 그 외엔 0.
+
+        프론트 차트가 혼잡도를 그대로 시리즈로 그릴 수 있어야 해서 이 엔드포인트의
+        congestion_level은 문자열('상'/'중'/'하'/null)이 아니라 정수 코드
+        (0=해당없음/1=여유/2=보통/3=혼잡)로 내려간다 - 스냅샷/상세 API와 같은 인코딩.
         """
         resp = client.get(f"/api/stores/{VALID_STORE_ID}/status", params={"date": REAL_DATE.isoformat()})
         assert resp.status_code == 200
@@ -205,9 +211,9 @@ class TestStoreStatusDay:
         assert len(rows) > 0
         for row in rows:
             if row["final_status"] == "영업중":
-                assert row["congestion_level"] in ("상", "중", "하")
+                assert row["congestion_level"] in (1, 2, 3)
             else:
-                assert row["congestion_level"] is None
+                assert row["congestion_level"] == 0
             # nullable 필드 타입 확인
             assert isinstance(row["is_synthetic"], bool)
             assert isinstance(row["is_redistributed"], bool)
