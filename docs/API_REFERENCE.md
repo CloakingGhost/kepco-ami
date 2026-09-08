@@ -3,7 +3,7 @@
 > 이 문서는 `scripts/generate_api_docs.py`가 FastAPI OpenAPI 스키마에서 **자동 생성**했습니다.
 > 코드(엔드포인트·모델)를 고쳤다면 재생성하세요: `uv run python scripts/generate_api_docs.py`
 >
-> 버전: `0.1.0` · 생성 시각: `2026-09-04 07:28 UTC`
+> 버전: `0.1.0` · 생성 시각: `2026-09-05 06:38 UTC`
 
 **Base URL(로컬)**: `http://localhost:8000`  (Swagger UI: `http://localhost:8000/docs`)
 
@@ -231,7 +231,7 @@ date/time 형식이 잘못됐거나 date가 조회 가능 범위를 벗어나면
 | `store_name` | `string \| null` |  |
 | `detected_at` | `string` |  |
 | `level` | `string` | 안전 등급. '주의'(사고가 나기에 충분한 조건 - 점검 필요) | '위험'(실제 사고 발생 - 즉시 조치). 아무 규칙에도 안 걸린 평상시는 '일반'이며, 이벤트 자체가 생성되지 않으므로 이 목록에는 나오지 않는다. |
-| `rule_triggered` | `string` | 발동한 규칙. 'kec212_overload_145pct_60min'(위험: 계약전력 145%가 60분 지속) | 'continuous_load_80pct_180min'(주의: 계약전력 80%가 3시간 지속) | 'pattern_deviation_3iqr_50pct_60min'(주의: 매장 자신의 패턴에서 3xIQR 이탈 + 계약전력 50% 이상이 60분 지속). 근거는 db/docs/안전감지_이상치_판정기준.md 참고. |
+| `rule_triggered` | `string` | 발동한 규칙. 'kec212_overload_130pct_60min'(위험: 계약전력 130%가 60분 지속 - 위험을 만드는 유일한 규칙) | 'continuous_load_80pct_180min'(주의: 계약전력 80%가 3시간 지속) | 'empty_store_baseline_3x_60min'(주의: 매장 자신의 '진짜폐점' 시간대 baseline에서 크게 벗어나 60분 지속). 근거는 db/docs/안전감지_이상치_판정기준.md 참고. |
 | `metric_value` | `number` | 실제 관측된 유효전력(kWh, 15분 슬롯 값) |
 | `threshold_value` | `number` | 그 규칙이 넘어섰다고 판정한 임계치(kWh, 15분 슬롯 값) |
 | `notified_at` | `string \| null` | 알림 발송 연동은 이번 범위 밖이라 항상 null |
@@ -241,45 +241,6 @@ date/time 형식이 잘못됐거나 date가 조회 가능 범위를 벗어나면
 ---
 
 ## 원시 전력값
-
-### `GET /api/meters/{meter_id}/timeseries`
-**계기 1곳의 하루 원시 전력값**
-
-15분 단위 전력값(kWh) + 각 슬롯의 혼잡도(정수 0~3)/영업상태를 반환한다 - 차트를
-이 한 번의 호출로 그릴 수 있게 하기 위함. 기준 시각 이후 슬롯은 잘라서 보낸다.
-
-**파라미터**
-
-| 이름 | 위치 | 타입 | 필수 | 예시 | 설명 |
-|---|---|---|:---:|---|---|
-| `meter_id` | path | `string` | O | A-L-11 | 계기번호(예: 'A-L-11') |
-| `date` | query | `string` |  |  | 조회할 날짜 (2026-04-01 ~ 2026-07-31). 2026-06-30까지 실측, 7월은 합성 구간. |
-| `time` | query | `string` |  |  | 기준 시각 'HH:MM'(15분 단위). 이 시각 이후(미래) 슬롯은 응답에서 제외한다. 생략하면 서버의 현재 시각 기준으로 자른다(과거 날짜면 하루 전체가 나옴). |
-
-**응답 (200)** — `MeterTimeseriesResponse`
-
-| 필드 | 타입 | 설명 |
-|---|---|---|
-| `meter_id` | `string` |  |
-| `date` | `string` |  |
-| `is_synthetic` | `boolean \| null` |  |
-| `data_resolution` | `string` | '15min'(정상, rows 96행) | '1hour' - 1hour 계기는 rows 길이가 96보다 짧을 수 있다. |
-| `rows` | `TimeseriesRow[]` | 15분 슬롯당 1행. data_resolution='1hour'이면 96행보다 적을 수 있다. |
-
-<details><summary><code>TimeseriesRow</code> 필드 상세</summary>
-
-| 필드 | 타입 | 설명 |
-|---|---|---|
-| `ts` | `string` |  |
-| `received_active_power_kwh` | `number \| null` |  |
-| `congestion_level` | `integer` | 혼잡도 코드. 0=해당없음(영업중이 아니거나 판정 없음) | 1=여유 | 2=보통 | 3=혼잡. 차트에 그대로 시리즈로 그릴 수 있도록 문자열이 아닌 정수로 내려간다. |
-| `final_status` | `string \| null` | '영업중' | '휴무추정' | '영업종료' | null(판정 없음) |
-| `is_synthetic` | `boolean` |  |
-| `is_redistributed` | `boolean` | true면 실제 15분 단위 실측이 아니라 코호트 비율로 추정한 값(DayStatusRow.is_redistributed와 동일 의미) |
-
-</details>
-
----
 
 ### `GET /api/stores/{store_id}/timeseries`
 **매장 1곳의 하루 원시 전력값**
@@ -292,7 +253,7 @@ meter_timeseries와 동일하나 store_id(상가 기준)로 조회한다.
 |---|---|---|:---:|---|---|
 | `store_id` | path | `integer` | O | 1 | 상가 ID (1~21) |
 | `date` | query | `string` |  |  | 조회할 날짜 (2026-04-01 ~ 2026-07-31). 2026-06-30까지 실측, 7월은 합성 구간. |
-| `time` | query | `string` |  |  | 기준 시각 'HH:MM'(15분 단위). 이 시각 이후(미래) 슬롯은 응답에서 제외한다. 생략하면 서버의 현재 시각 기준으로 자른다(과거 날짜면 하루 전체가 나옴). |
+| `time` | query | `string` |  |  | 기준 시각 'HH:MM'(15분 단위). 이 시각 이후(미래) 슬롯은 응답에서 제외한다. 생략하면 서버의 현재 시:분을 date에 붙여서 자른다(날짜와 무관하게 항상 00:00~그 시:분까지만 나오며, 하루 전체가 새는 일은 없다). |
 
 **응답 (200)** — `StoreTimeseriesResponse`
 

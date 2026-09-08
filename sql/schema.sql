@@ -167,13 +167,20 @@ CREATE TABLE IF NOT EXISTS anomaly_events (
         -- 나중에 "점검했고 정상이었다"를 명시적으로 기록할 필요가 생기면 바로 쓰기 위함.
     rule_triggered             TEXT NOT NULL,
         -- 어떤 규칙이 발동했는지. 값과 근거는 db/src/ami_db/anomaly.py 모듈 docstring 참고:
-        --   'kec212_overload_145pct_60min'    (위험) 계약전력 145%가 60분 지속 - KEC 212
-        --   'continuous_load_80pct_180min'    (주의) 계약전력 80%가 3시간 지속 - 연속부하 80% 규칙
-        --   'pattern_deviation_3iqr_50pct_60min' (주의) 매장 자신의 패턴에서 3xIQR 이탈 +
-        --                                      계약전력 50% 이상이 60분 지속
-        -- 세 규칙 전부 "계약전력 대비 절대 비율 + 지속시간"의 쌍으로 정의된다. 통계적
-        -- 이상치(Tukey 등)를 그대로 등급에 매핑하지 않는 이유는 anomaly.py docstring 참고
-        -- (실측 3개월에서 위험 4,111건이 나와 "50분에 한 번 전기사고"라는 결론이 됐었음).
+        --   'kec212_overload_130pct_60min'  (위험) 계약전력 130%가 60분 지속 - KEC 212.3
+        --                                    표 212.3-2(산업용 배선차단기, 상업용 계기 적용).
+        --                                    "위험"을 만드는 유일한 규칙 - 통계 기반 규칙은
+        --                                    위험을 만들지 않는다(아래 참고).
+        --   'continuous_load_80pct_180min'  (주의) 계약전력 80%가 3시간 지속 - 연속부하 80% 규칙
+        --   'empty_store_baseline_3x_60min' (주의) 매장 자신의 "진짜폐점"(영업시간표가 아니라
+        --                                    그 계기 자신의 (요일,슬롯) 이력으로 판별한, 평소
+        --                                    조용하고 안정적인 시간) baseline에서 Tukey outer
+        --                                    fence(3xIQR) 이상 벗어나 60분 지속
+        -- 통계적 이상치(Tukey 등)를 그대로 등급에 매핑하지 않는 이유, 그리고 "위험"을
+        -- 물리 기준 1개로만 좁힌 이유는 anomaly.py docstring 참고(실측 3개월에서 위험
+        -- 4,111건 -> 통계+등급 결합 재설계 -> 그래도 개인화 규칙에 위험을 남기면 냉동고
+        -- 압축기 같은 정상 주기 활동이 63건씩 잡히는 문제가 재발해 최종적으로 위험을
+        -- KEC 규칙 전용으로 뺐다).
     metric_value               DOUBLE PRECISION NOT NULL,   -- 실제 관측된 recv_kWh
     threshold_value              DOUBLE PRECISION NOT NULL,   -- 그 규칙이 넘어섰다고 판정한 임계치(kWh)
     notified_at                   TIMESTAMPTZ,                 -- 알림 발송 연동은 이번 범위 밖. 항상 NULL이어도 무방

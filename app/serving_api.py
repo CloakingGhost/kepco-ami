@@ -321,6 +321,7 @@ def list_anomalies(
 @app.get(
     "/api/meters/{meter_id}/timeseries", tags=["원시 전력값"], summary="계기 1곳의 하루 원시 전력값",
     response_model=MeterTimeseriesResponse,
+    include_in_schema=False
 )
 def meter_timeseries(
     meter_id: str = PathParam(..., description="계기번호(예: 'A-L-11')", examples=[EXAMPLE_METER_ID]),

@@ -43,19 +43,19 @@ SYNTHETIC_END_DATE = date(2026, 7, 31)
 #
 # load_ratio는 "감지 임계치"가 아니라 "실제로 주입할 부하 수준"이다 - 임계치에 딱 맞춰
 # 주입하면 노이즈로 일부 슬롯이 미달돼 지속 조건이 깨진다(inject_sustained_load_scenario
-# docstring 참고). 그래서 임계치(1.45 / 0.80)에서 충분히 떨어뜨려 잡았다.
+# docstring 참고). 그래서 임계치(1.30 / 0.80)에서 충분히 떨어뜨려 잡았다.
 MANUAL_SCENARIOS = [
     {
         "meter_id": "A-L-60", "date": date(2026, 7, 2),   # 목요일, 영업 11:00~22:00
         "start_slot": 8, "duration_slots": 4,              # 02:00~02:45 = 60분
-        "load_ratio": 1.70,                                # 위험 임계 145% 초과
+        "load_ratio": 1.70,                                # 위험 임계 130% 초과
         "kind": "danger_overload",
-        "detail": "계약전력 170%를 60분 지속 - KEC212 위험(사고 발생) 조건",
+        "detail": "계약전력 170%를 60분 지속 - KEC212.3(산업용 표) 위험(사고 발생) 조건",
     },
     {
         "meter_id": "A-L-65", "date": date(2026, 7, 15),  # 수요일, 00:00~03:00 폐점 확인됨
         "start_slot": 0, "duration_slots": 12,             # 00:00~02:45 = 3시간
-        "load_ratio": 0.95,                                # 연속부하 80% 초과, 위험 145% 미만
+        "load_ratio": 0.95,                                # 연속부하 80% 초과, 위험 130% 미만
         "kind": "continuous_load",
         "detail": "계약전력 95%를 3시간 지속 - 연속부하 80% 규칙 초과(사고 충분조건)",
     },

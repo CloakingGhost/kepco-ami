@@ -221,11 +221,12 @@ class AnomalySchema(BaseModel):
                     "'일반'이며, 이벤트 자체가 생성되지 않으므로 이 목록에는 나오지 않는다.",
     )
     rule_triggered: str = Field(
-        examples=["kec212_overload_145pct_60min"],
-        description="발동한 규칙. 'kec212_overload_145pct_60min'(위험: 계약전력 145%가 60분 지속) | "
-                    "'continuous_load_80pct_180min'(주의: 계약전력 80%가 3시간 지속) | "
-                    "'pattern_deviation_3iqr_50pct_60min'(주의: 매장 자신의 패턴에서 3xIQR 이탈 + "
-                    "계약전력 50% 이상이 60분 지속). 근거는 db/docs/안전감지_이상치_판정기준.md 참고.",
+        examples=["kec212_overload_130pct_60min"],
+        description="발동한 규칙. 'kec212_overload_130pct_60min'(위험: 계약전력 130%가 60분 지속 - "
+                    "위험을 만드는 유일한 규칙) | 'continuous_load_80pct_180min'(주의: 계약전력 80%가 "
+                    "3시간 지속) | 'empty_store_baseline_3x_60min'(주의: 매장 자신의 '진짜폐점' "
+                    "시간대 baseline에서 크게 벗어나 60분 지속). 근거는 db/docs/"
+                    "안전감지_이상치_판정기준.md 참고.",
     )
     metric_value: float = Field(description="실제 관측된 유효전력(kWh, 15분 슬롯 값)")
     threshold_value: float = Field(description="그 규칙이 넘어섰다고 판정한 임계치(kWh, 15분 슬롯 값)")

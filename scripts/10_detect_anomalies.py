@@ -2,15 +2,20 @@
 """
 2-7단계(2차 우선순위): anomaly_events 배치 계산/적재.
 
-판정 규칙 3종(위험 1개, 주의 2개)과 그 전기설비 기준 근거는 전부
-ami_db.anomaly 모듈 docstring에 정리돼 있다. 요약하면:
-  - 위험 = 계약전력 145%가 60분 지속(KEC 212) - 이미 사고 조건에 진입
+판정 규칙 3종(위험 1개, 주의 2개)과 그 근거는 전부 ami_db.anomaly 모듈
+docstring에 정리돼 있다. 요약하면:
+  - 위험 = 계약전력 130%가 60분 지속(KEC 212.3 산업용 표) - 물리적으로 검증된
+           유일한 위험 신호. 통계 기반 개인화 규칙은 "위험"을 만들지 않는다
+           (이유: anomaly.py "규칙이 겹칠 때" 앞 단락 참고).
   - 주의 = 계약전력 80%가 3시간 지속(연속부하 80% 규칙) 또는
-           매장 자신의 패턴에서 3xIQR 이탈 + 계약전력 50% 이상이 60분 지속
+           매장 자신의 "진짜폐점" baseline에서 1.5x 이상 튀어 60분 지속
 
 "영업종료 이후" 개념(data/프로젝트개요.md)을 구현하기 위해, 09단계에서 이미
-계산해 둔 store_operating_status.schedule_status='closed_hours'인 슬롯만
-판정 대상으로 본다.
+계산해 둔 store_operating_status.schedule_status='closed_hours'인 슬롯을 1차로
+거르고, 그 안에서도 그 매장의 (요일,슬롯)별 실측 중앙값이 night_baseline에
+가까운(=원래도 조용한) 슬롯만 최종 판정 대상으로 삼는다(anomaly.py의
+compute_group_thresholds/is_quiet_slot) - 영업시간표 자체가 준비시간을 못 가르거나
+틀린 경우(실측 검증됨)를 데이터 기반으로 걸러내기 위함.
 """
 import sys
 from pathlib import Path
@@ -22,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from ami_db.anomaly import compute_group_thresholds, detect_events  # noqa: E402
 from ami_db.config import GENERATED_DIR, VIZ_OUTPUT, settings  # noqa: E402
 from ami_db.db import bulk_insert, get_raw_connection  # noqa: E402
+from ami_db.synthetic import compute_night_baseline  # noqa: E402
 
 
 def main() -> None:
@@ -50,7 +56,8 @@ def main() -> None:
             real_ts = real_ts_all[real_ts_all["meter_id"] == meter_id]
             if real_ts.empty:
                 continue
-            thresholds = compute_group_thresholds(real_ts)
+            night_baseline = compute_night_baseline(real_ts)
+            eligibility, baseline_median, baseline_floor = compute_group_thresholds(real_ts, night_baseline)
             contract_power_kw = contract_power_by_meter.get(meter_id)
 
             with conn.cursor() as cur:
@@ -69,7 +76,7 @@ def main() -> None:
             if closed_hours_ts.empty:
                 continue
 
-            flagged = detect_events(closed_hours_ts, thresholds, contract_power_kw)
+            flagged = detect_events(closed_hours_ts, eligibility, contract_power_kw, baseline_median, baseline_floor)
             if flagged.empty:
                 continue
 
