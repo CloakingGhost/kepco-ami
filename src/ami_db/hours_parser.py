@@ -115,9 +115,11 @@ def parse_places_hours_lines(lines: list[str]) -> list[HoursRow]:
     by_day: dict[int, HoursRow] = {}
     for line in lines:
         day_idx = None
+        day_name = None
         for name, idx in DAY_NAME_TO_INDEX.items():
             if line.startswith(name):
                 day_idx = idx
+                day_name = name
                 break
         if day_idx is None:
             continue  # 요일로 시작하지 않는 줄(예외적인 안내 문구)은 건너뜀
@@ -136,7 +138,11 @@ def parse_places_hours_lines(lines: list[str]) -> list[HoursRow]:
             by_day[day_idx] = HoursRow(day_idx, None, None, True, False, raw_text=line)
             continue
         open_t, close_t = parsed
-        by_day[day_idx] = HoursRow(day_idx, open_t, close_t, False, False, raw_text=line)
+        # Google 원문은 "오전 11:00 ~ 오후 9:00"처럼 12시간제로 오지만, raw_text는
+        # DB에 그대로 저장돼(store_operating_hours.raw_hours_text) open_time/close_time과
+        # 표기가 어긋나 보이므로 파싱해서 이미 얻은 24시간제 값으로 다시 조립해 저장한다.
+        normalized_text = f"{day_name}: {open_t.strftime('%H:%M')} ~ {close_t.strftime('%H:%M')}"
+        by_day[day_idx] = HoursRow(day_idx, open_t, close_t, False, False, raw_text=normalized_text)
 
     return [
         by_day.get(day, HoursRow(day, None, None, True, False, raw_text=None))
