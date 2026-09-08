@@ -9,7 +9,7 @@ serving_api.py가 너무 길어짐). places-api-project/src/places_api/models.py
 """
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import date as date_type, datetime, time
 
 from pydantic import BaseModel, Field
 
@@ -171,6 +171,52 @@ class StoreDetailRequest(BaseModel):
     time: str | None = Field(
         default=None, examples=["19:15"],
         description="기준 시각 'HH:MM'(00:00~23:45, 15분 단위). date와 함께 사용한다.",
+    )
+
+
+class StoreIdRequest(BaseModel):
+    store_id: int = Field(examples=[1], description="상가 ID (1~21). body로 받는 이유는 URL에 store_id를 노출하지 않기 위함")
+
+
+class StoreStatusDayRequest(BaseModel):
+    store_id: int = Field(examples=[1], description="상가 ID (1~21). body로 받는 이유는 URL에 store_id를 노출하지 않기 위함")
+    date: date_type = Field(
+        default=date_type(2026, 5, 15), examples=["2026-05-15"],
+        description="조회할 날짜. 2026-04-01~2026-06-30은 실측, 2026-07-01~오늘은 합성 데이터(is_synthetic로 구분됨).",
+    )
+    time: str | None = Field(
+        default=None, examples=["12:00"],
+        description="기준 시각 'HH:MM'(15분 단위). 이 시각 이후(미래) 슬롯은 응답에서 제외한다. "
+                    "생략하면 서버의 현재 시:분을 date에 붙여서 자른다(날짜와 무관하게 항상 "
+                    "00:00~그 시:분까지만 나오며, 하루 전체가 새는 일은 없다).",
+    )
+
+
+class MeterTimeseriesRequest(BaseModel):
+    meter_id: str = Field(examples=["A-L-11"], description="계기번호. body로 받는 이유는 URL에 meter_id를 노출하지 않기 위함")
+    date: date_type = Field(
+        default=date_type(2026, 5, 15), examples=["2026-05-15"],
+        description="조회할 날짜 (2026-04-01~오늘). 2026-06-30까지 실측, 7월은 합성 구간.",
+    )
+    time: str | None = Field(
+        default=None, examples=["12:00"],
+        description="기준 시각 'HH:MM'(15분 단위). 이 시각 이후(미래) 슬롯은 응답에서 제외한다. "
+                    "생략하면 서버의 현재 시:분을 date에 붙여서 자른다(날짜와 무관하게 항상 "
+                    "00:00~그 시:분까지만 나오며, 하루 전체가 새는 일은 없다).",
+    )
+
+
+class StoreTimeseriesRequest(BaseModel):
+    store_id: int = Field(examples=[1], description="상가 ID (1~21). body로 받는 이유는 URL에 store_id를 노출하지 않기 위함")
+    date: date_type = Field(
+        default=date_type(2026, 5, 15), examples=["2026-05-15"],
+        description="조회할 날짜 (2026-04-01~오늘). 2026-06-30까지 실측, 7월은 합성 구간.",
+    )
+    time: str | None = Field(
+        default=None, examples=["12:00"],
+        description="기준 시각 'HH:MM'(15분 단위). 이 시각 이후(미래) 슬롯은 응답에서 제외한다. "
+                    "생략하면 서버의 현재 시:분을 date에 붙여서 자른다(날짜와 무관하게 항상 "
+                    "00:00~그 시:분까지만 나오며, 하루 전체가 새는 일은 없다).",
     )
 
 

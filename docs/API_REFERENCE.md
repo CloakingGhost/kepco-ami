@@ -3,7 +3,7 @@
 > 이 문서는 `scripts/generate_api_docs.py`가 FastAPI OpenAPI 스키마에서 **자동 생성**했습니다.
 > 코드(엔드포인트·모델)를 고쳤다면 재생성하세요: `uv run python scripts/generate_api_docs.py`
 >
-> 버전: `0.1.0` · 생성 시각: `2026-09-05 06:38 UTC`
+> 버전: `0.1.0` · 생성 시각: `2026-09-08 15:07 UTC`
 
 **Base URL(로컬)**: `http://localhost:8000`  (Swagger UI: `http://localhost:8000/docs`)
 
@@ -180,6 +180,98 @@ date/time 형식이 잘못됐거나 date가 조회 가능 범위를 벗어나면
 
 ---
 
+### `POST /api/stores/status/current`
+**매장 1곳 현재 상태**
+
+store_id를 body로 받는다(URL에 store_id를 노출하지 않으려고 POST를 씀).
+예시: body `{"store_id": 1}` -> 못난이찹쌀꽈배기의 현재 상태.
+store_id 범위를 벗어나거나(1~21이 아니거나) 아직 상태가 계산되지 않았으면 404.
+
+**응답 (200)** — `CurrentStatusOneSchema`
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `store_id` | `integer` |  |
+| `name` | `string` |  |
+| `ts` | `string` | 이 상태를 계산한 15분 슬롯 시각(현재 시각 이하 중 가장 최근) |
+| `schedule_status` | `string` | 'open_hours' | 'closed_hours' - 운영시간표 기준 판정 |
+| `power_status` | `string` | 'active' | 'low' - 야간 baseline 대비 실측 전력 기준 판정 |
+| `final_status` | `string` | '영업중' | '휴무추정' | '예외영업' | '영업종료' |
+| `congestion_level` | `string \| null` | '상' | '중' | '하' | null(영업중이 아니면 null) |
+
+---
+
+### `POST /api/stores/hours`
+**매장 1곳의 요일별 운영시간**
+
+store_id를 body로 받는다(URL에 store_id를 노출하지 않으려고 POST를 씀).
+예시: body `{"store_id": 1}` -> 못난이찹쌀꽈배기의 요일별(월~일) 운영시간.
+google_places 실측이 있으면 그걸, 없으면 ksic_estimate(업종코드 기반 추정)를
+반환한다 - 각 행의 `source`로 어느 쪽인지 구분된다. store_id 범위를 벗어나면 404.
+
+**응답 (200)** — `StoreHoursResponse`
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `store_id` | `integer` |  |
+| `hours` | `StoreHoursRow[]` | 요일별 0~7행. day_of_week 기준 최대 7행(요일당 1행, google_places 우선) |
+
+<details><summary><code>StoreHoursRow</code> 필드 상세</summary>
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `day_of_week` | `integer` | 0=월요일 ... 6=일요일 |
+| `open_time` | `string \| null` | 휴무일이면 null |
+| `close_time` | `string \| null` | 휴무일이면 null |
+| `is_closed` | `boolean` |  |
+| `is_24h` | `boolean` |  |
+| `source` | `string` | 'google_places'(실측) | 'ksic_estimate'(업종코드 기반 추정) - 실측이 있으면 항상 실측 우선 |
+
+</details>
+
+---
+
+### `POST /api/stores/status/day`
+**매장 1곳의 하루 상태+전력 타임라인**
+
+store_id를 body로 받는다(URL에 store_id를 노출하지 않으려고 POST를 씀).
+
+예시: body `{"store_id": 1, "date": "2026-05-15"}` -> 15분 슬롯별
+schedule_status/power_status/final_status/congestion_level(정수 0~3) + 전력값(kWh).
+화면의 "시간대별 전력" 차트를 이 한 번의 호출로 그릴 수 있다.
+
+**기준 시각**: body에 time을 같이 주면 그 시각 이후(미래) 슬롯은 잘라서 응답에서
+제외한다(96개보다 적을 수 있음) - 화면에서 사용자가 고른 기준 시각을 그대로 넘기면
+차트가 그 시각 이후로 새지 않는다. 생략하면 서버의 현재 시:분 기준.
+
+store_id 범위를 벗어나면 404, date/time이 조회 가능 범위 밖이면 400.
+
+**응답 (200)** — `DayStatusResponse`
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `store_id` | `integer` |  |
+| `date` | `string` |  |
+| `data_resolution` | `string` | '15min'(정상, rows 96행) | '1hour' - 1hour인 매장은 결측 슬롯의 판정 자체를 생략하므로 rows 길이가 96보다 짧을 수 있다(빈 슬롯=결측 gap으로 해석할 것). |
+| `rows` | `DayStatusRow[]` | 15분 슬롯당 1행. data_resolution='1hour'인 매장은 96행보다 적을 수 있다. |
+
+<details><summary><code>DayStatusRow</code> 필드 상세</summary>
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `ts` | `string` |  |
+| `schedule_status` | `string` |  |
+| `power_status` | `string` |  |
+| `final_status` | `string` | '영업중' | '휴무추정' | '영업종료'('예외영업'은 '영업종료'로 단순화) |
+| `congestion_level` | `integer` | 혼잡도 코드. 0=해당없음 | 1=여유 | 2=보통 | 3=혼잡 |
+| `received_active_power_kwh` | `number \| null` | 15분 유효전력(kWh). 결측이면 null |
+| `is_synthetic` | `boolean` | false=실측(2026-04-01~06-30), true=합성(2026-07-01~오늘) |
+| `is_redistributed` | `boolean` | true면 이 슬롯의 전력값이 실제 15분 단위 실측이 아니라, 같은 업종 코호트의 시간 내 상대 형태를 정각 실측값에 앵커링해 추정한 값(data_resolution='1hour' 계기 중 한식 코호트가 충분한 경우에만 적용됨) |
+
+</details>
+
+---
+
 ## 안전감지
 
 ### `GET /api/anomalies`
@@ -242,18 +334,45 @@ date/time 형식이 잘못됐거나 date가 조회 가능 범위를 벗어나면
 
 ## 원시 전력값
 
-### `GET /api/stores/{store_id}/timeseries`
+### `POST /api/meters/timeseries`
+**계기 1곳의 하루 원시 전력값**
+
+meter_id를 body로 받는다(URL에 meter_id를 노출하지 않으려고 POST를 씀).
+
+15분 단위 전력값(kWh) + 각 슬롯의 혼잡도(정수 0~3)/영업상태를 반환한다 - 차트를
+이 한 번의 호출로 그릴 수 있게 하기 위함. body에 time을 주면 그 시각 이후(미래)
+슬롯은 잘라서 응답에서 제외한다.
+
+**응답 (200)** — `MeterTimeseriesResponse`
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `meter_id` | `string` |  |
+| `date` | `string` |  |
+| `is_synthetic` | `boolean \| null` |  |
+| `data_resolution` | `string` | '15min'(정상, rows 96행) | '1hour' - 1hour 계기는 rows 길이가 96보다 짧을 수 있다. |
+| `rows` | `TimeseriesRow[]` | 15분 슬롯당 1행. data_resolution='1hour'이면 96행보다 적을 수 있다. |
+
+<details><summary><code>TimeseriesRow</code> 필드 상세</summary>
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `ts` | `string` |  |
+| `received_active_power_kwh` | `number \| null` |  |
+| `congestion_level` | `integer` | 혼잡도 코드. 0=해당없음(영업중이 아니거나 판정 없음) | 1=여유 | 2=보통 | 3=혼잡. 차트에 그대로 시리즈로 그릴 수 있도록 문자열이 아닌 정수로 내려간다. |
+| `final_status` | `string \| null` | '영업중' | '휴무추정' | '영업종료' | null(판정 없음) |
+| `is_synthetic` | `boolean` |  |
+| `is_redistributed` | `boolean` | true면 실제 15분 단위 실측이 아니라 코호트 비율로 추정한 값(DayStatusRow.is_redistributed와 동일 의미) |
+
+</details>
+
+---
+
+### `POST /api/stores/timeseries`
 **매장 1곳의 하루 원시 전력값**
 
+store_id를 body로 받는다(URL에 store_id를 노출하지 않으려고 POST를 씀).
 meter_timeseries와 동일하나 store_id(상가 기준)로 조회한다.
-
-**파라미터**
-
-| 이름 | 위치 | 타입 | 필수 | 예시 | 설명 |
-|---|---|---|:---:|---|---|
-| `store_id` | path | `integer` | O | 1 | 상가 ID (1~21) |
-| `date` | query | `string` |  |  | 조회할 날짜 (2026-04-01 ~ 2026-07-31). 2026-06-30까지 실측, 7월은 합성 구간. |
-| `time` | query | `string` |  |  | 기준 시각 'HH:MM'(15분 단위). 이 시각 이후(미래) 슬롯은 응답에서 제외한다. 생략하면 서버의 현재 시:분을 date에 붙여서 자른다(날짜와 무관하게 항상 00:00~그 시:분까지만 나오며, 하루 전체가 새는 일은 없다). |
 
 **응답 (200)** — `StoreTimeseriesResponse`
 

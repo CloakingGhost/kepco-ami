@@ -4,8 +4,9 @@ data/프로젝트개요.md 개발우선순위 1번(영업유무·혼잡도)과 2
 대응하는 조회용 FastAPI. 포트 8000(Google Places 호출은 04단계 배치 스크립트 안에서
 인프로세스로만 발생 - places-api-project는 더 이상 서버로 뜨지 않아 포트 충돌이 없음).
 
-- 1번(영업유무/혼잡도): /api/stores*, /api/stores/{id}/status* 가 담당 - store_operating_status를
-  09_compute_operating_status.py가 미리 계산해 둔 결과를 그대로 읽는다.
+- 1번(영업유무/혼잡도): /api/stores*가 담당 - store_operating_status를 09_compute_operating_status.py가
+  미리 계산해 둔 결과를 그대로 읽는다. store_id/meter_id처럼 특정 대상을 지목하는 조회는 URL에
+  ID를 노출하지 않도록 전부 POST + body로 받는다(예: POST /api/stores/status/day).
 - 2번(안전감지): /api/anomalies가 담당 - anomaly_events(10_detect_anomalies.py 산출물)를 그대로 읽는다.
   단, "이상치 감지 결과 조회"까지만 커버한다. "점주에게 알림 문자 전송"(notified_at 채우기)은
   이번 범위 밖이라 이 API로는 할 수 없다.
@@ -25,7 +26,7 @@ from typing import Literal
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from fastapi import FastAPI, HTTPException, Path as PathParam, Query  # noqa: E402
+from fastapi import FastAPI, HTTPException, Query  # noqa: E402
 
 from ami_db.db import get_engine  # noqa: E402
 from ami_db.serving import (  # noqa: E402
@@ -49,12 +50,16 @@ from app.schemas import (  # noqa: E402
     CurrentStatusListResponse,
     CurrentStatusOneSchema,
     DayStatusResponse,
+    MeterTimeseriesRequest,
     MeterTimeseriesResponse,
     StoreDetailRequest,
     StoreDetailResponse,
     StoreHoursResponse,
+    StoreIdRequest,
     StoreListResponse,
     StoreSnapshotResponse,
+    StoreStatusDayRequest,
+    StoreTimeseriesRequest,
     StoreTimeseriesResponse,
 )
 
@@ -71,11 +76,8 @@ app = FastAPI(
 _engine = get_engine()
 
 # Swagger 예시용으로 쓰는 실제 DB 값들 (store_id는 항상 1~21, meter_id는 A-L-nn 패턴).
-# 자세한 매핑은 db/docs/API_REFERENCE.md 참고.
-EXAMPLE_STORE_ID = 1          # 못난이찹쌀꽈배기 - Google에 운영시간 정보 없어 ksic_estimate 폴백 케이스
-EXAMPLE_METER_ID = "A-L-11"   # 위 store_id=1과 동일 매장의 계기번호
-EXAMPLE_DATE_REAL = date(2026, 5, 15)       # 실측 구간 예시 날짜
-EXAMPLE_DATE_SYNTHETIC = date(2026, 7, 15)  # 합성 구간 예시 날짜(7월, 주의 시나리오가 심긴 날)
+# 자세한 매핑은 db/docs/API_REFERENCE.md 참고. store_id/meter_id 자체의 예시값은 이제
+# body 스키마 쪽(app/schemas.py)에 있으므로 여기서는 anomalies 필터에서만 쓰는 값만 남긴다.
 EXAMPLE_DANGER_METER_ID = "A-L-60"          # 7월 '위험' 시나리오가 심긴 계기(충북식당)
 EXAMPLE_CAUTION_METER_ID = "A-L-65"         # 7월 '주의' 시나리오가 심긴 계기(와카츠)
 
@@ -184,78 +186,71 @@ def stores_snapshot(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.get(
-    "/api/stores/{store_id}/status/current", tags=["영업유무·혼잡도"], summary="매장 1곳 현재 상태",
+@app.post(
+    "/api/stores/status/current", tags=["영업유무·혼잡도"], summary="매장 1곳 현재 상태",
     response_model=CurrentStatusOneSchema,
     include_in_schema=False
 )
-def store_current_status(
-    store_id: int = PathParam(..., description="상가 ID (1~21)", examples=[EXAMPLE_STORE_ID]),
-):
+def store_current_status(body: StoreIdRequest):
     """
-    예시: `/api/stores/1/status/current` -> 못난이찹쌀꽈배기의 현재 상태.
+    store_id를 body로 받는다(URL에 store_id를 노출하지 않으려고 POST를 씀).
+    예시: body `{"store_id": 1}` -> 못난이찹쌀꽈배기의 현재 상태.
     store_id 범위를 벗어나거나(1~21이 아니거나) 아직 상태가 계산되지 않았으면 404.
     """
-    result = get_current_status_one(_engine, store_id)
+    result = get_current_status_one(_engine, body.store_id)
     if result is None:
-        raise HTTPException(status_code=404, detail=f"store_id={store_id}의 상태 데이터가 없습니다 (1~21 범위인지 확인하세요)")
+        raise HTTPException(status_code=404, detail=f"store_id={body.store_id}의 상태 데이터가 없습니다 (1~21 범위인지 확인하세요)")
     return result
 
 
-@app.get(
-    "/api/stores/{store_id}/hours", tags=["영업유무·혼잡도"], summary="매장 1곳의 요일별 운영시간",
+@app.post(
+    "/api/stores/hours", tags=["영업유무·혼잡도"], summary="매장 1곳의 요일별 운영시간",
     response_model=StoreHoursResponse,
     include_in_schema=False
 )
-def store_hours(
-    store_id: int = PathParam(..., description="상가 ID (1~21)", examples=[EXAMPLE_STORE_ID]),
-):
+def store_hours(body: StoreIdRequest):
     """
-    예시: `/api/stores/1/hours` -> 못난이찹쌀꽈배기의 요일별(월~일) 운영시간.
+    store_id를 body로 받는다(URL에 store_id를 노출하지 않으려고 POST를 씀).
+    예시: body `{"store_id": 1}` -> 못난이찹쌀꽈배기의 요일별(월~일) 운영시간.
     google_places 실측이 있으면 그걸, 없으면 ksic_estimate(업종코드 기반 추정)를
     반환한다 - 각 행의 `source`로 어느 쪽인지 구분된다. store_id 범위를 벗어나면 404.
     """
-    rows = get_store_hours(_engine, store_id)
+    rows = get_store_hours(_engine, body.store_id)
     if rows is None:
-        raise HTTPException(status_code=404, detail=f"store_id={store_id}의 매장이 없습니다 (1~21 범위인지 확인하세요)")
-    return {"store_id": store_id, "hours": rows}
+        raise HTTPException(status_code=404, detail=f"store_id={body.store_id}의 매장이 없습니다 (1~21 범위인지 확인하세요)")
+    return {"store_id": body.store_id, "hours": rows}
 
 
-@app.get(
-    "/api/stores/{store_id}/status", tags=["영업유무·혼잡도"], summary="매장 1곳의 하루 상태+전력 타임라인",
+@app.post(
+    "/api/stores/status/day", tags=["영업유무·혼잡도"], summary="매장 1곳의 하루 상태+전력 타임라인",
     response_model=DayStatusResponse,
     include_in_schema=False
 )
-def store_status_day(
-    store_id: int = PathParam(..., description="상가 ID (1~21)", examples=[EXAMPLE_STORE_ID]),
-    date: date = Query(
-        default=EXAMPLE_DATE_REAL,
-        description=f"조회할 날짜. {EARLIEST_SAMPLE_DATE}~2026-06-30은 실측, "
-                     f"2026-07-01~{LATEST_SERVICE_DATE}는 합성 데이터(is_synthetic로 구분됨).",
-    ),
-    time: str | None = Query(
-        default=None,
-        description="기준 시각 'HH:MM'(15분 단위). 이 시각 이후(미래) 슬롯은 응답에서 제외한다. "
-                    "생략하면 서버의 현재 시:분을 date에 붙여서 자른다(날짜와 무관하게 항상 "
-                    "00:00~그 시:분까지만 나오며, 하루 전체가 새는 일은 없다).",
-    ),
-):
+def store_status_day(body: StoreStatusDayRequest):
     """
-    예시: `/api/stores/1/status?date=2026-05-15` -> 15분 슬롯별
+    store_id를 body로 받는다(URL에 store_id를 노출하지 않으려고 POST를 씀).
+
+    예시: body `{"store_id": 1, "date": "2026-05-15"}` -> 15분 슬롯별
     schedule_status/power_status/final_status/congestion_level(정수 0~3) + 전력값(kWh).
-    화면의 "시간대별 전력" 차트를 이 한 번의 호출로 그릴 수 있다. 기준 시각 이후
-    슬롯은 잘라서 보내므로 96개보다 적을 수 있다.
+    화면의 "시간대별 전력" 차트를 이 한 번의 호출로 그릴 수 있다.
+
+    **기준 시각**: body에 time을 같이 주면 그 시각 이후(미래) 슬롯은 잘라서 응답에서
+    제외한다(96개보다 적을 수 있음) - 화면에서 사용자가 고른 기준 시각을 그대로 넘기면
+    차트가 그 시각 이후로 새지 않는다. 생략하면 서버의 현재 시:분 기준.
+
     store_id 범위를 벗어나면 404, date/time이 조회 가능 범위 밖이면 400.
     """
     try:
-        result = get_store_status_day(_engine, store_id, date, parse_snapshot_time(time) if time else None)
+        result = get_store_status_day(
+            _engine, body.store_id, body.date, parse_snapshot_time(body.time) if body.time else None
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     if result is None:
-        raise HTTPException(status_code=404, detail=f"store_id={store_id}의 매장이 없습니다 (1~21 범위인지 확인하세요)")
+        raise HTTPException(status_code=404, detail=f"store_id={body.store_id}의 매장이 없습니다 (1~21 범위인지 확인하세요)")
     return {
-        "store_id": store_id,
-        "date": date.isoformat(),
+        "store_id": body.store_id,
+        "date": body.date.isoformat(),
         "data_resolution": result.data_resolution,
         "rows": result.rows,
     }
@@ -318,31 +313,23 @@ def list_anomalies(
     return {"total": total, "limit": limit, "offset": offset, "anomalies": rows}
 
 
-@app.get(
-    "/api/meters/{meter_id}/timeseries", tags=["원시 전력값"], summary="계기 1곳의 하루 원시 전력값",
+@app.post(
+    "/api/meters/timeseries", tags=["원시 전력값"], summary="계기 1곳의 하루 원시 전력값",
     response_model=MeterTimeseriesResponse,
     include_in_schema=False
 )
-def meter_timeseries(
-    meter_id: str = PathParam(..., description="계기번호(예: 'A-L-11')", examples=[EXAMPLE_METER_ID]),
-    date: date = Query(
-        default=EXAMPLE_DATE_REAL,
-        description=f"조회할 날짜 ({EARLIEST_SAMPLE_DATE} ~ {LATEST_SERVICE_DATE}). "
-                    f"2026-06-30까지 실측, 7월은 합성 구간.",
-    ),
-    time: str | None = Query(
-        default=None,
-        description="기준 시각 'HH:MM'(15분 단위). 이 시각 이후(미래) 슬롯은 응답에서 제외한다. "
-                    "생략하면 서버의 현재 시:분을 date에 붙여서 자른다(날짜와 무관하게 항상 "
-                    "00:00~그 시:분까지만 나오며, 하루 전체가 새는 일은 없다).",
-    ),
-):
+def meter_timeseries(body: MeterTimeseriesRequest):
     """
+    meter_id를 body로 받는다(URL에 meter_id를 노출하지 않으려고 POST를 씀).
+
     15분 단위 전력값(kWh) + 각 슬롯의 혼잡도(정수 0~3)/영업상태를 반환한다 - 차트를
-    이 한 번의 호출로 그릴 수 있게 하기 위함. 기준 시각 이후 슬롯은 잘라서 보낸다.
+    이 한 번의 호출로 그릴 수 있게 하기 위함. body에 time을 주면 그 시각 이후(미래)
+    슬롯은 잘라서 응답에서 제외한다.
     """
     try:
-        result = get_meter_day_series(_engine, meter_id, date, parse_snapshot_time(time) if time else None)
+        result = get_meter_day_series(
+            _engine, body.meter_id, body.date, parse_snapshot_time(body.time) if body.time else None
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {
@@ -354,31 +341,23 @@ def meter_timeseries(
     }
 
 
-@app.get(
-    "/api/stores/{store_id}/timeseries", tags=["원시 전력값"], summary="매장 1곳의 하루 원시 전력값",
+@app.post(
+    "/api/stores/timeseries", tags=["원시 전력값"], summary="매장 1곳의 하루 원시 전력값",
     response_model=StoreTimeseriesResponse,
 )
-def store_timeseries(
-    store_id: int = PathParam(..., description="상가 ID (1~21)", examples=[EXAMPLE_STORE_ID]),
-    date: date = Query(
-        default=EXAMPLE_DATE_REAL,
-        description=f"조회할 날짜 ({EARLIEST_SAMPLE_DATE} ~ {LATEST_SERVICE_DATE}). "
-                    f"2026-06-30까지 실측, 7월은 합성 구간.",
-    ),
-    time: str | None = Query(
-        default=None,
-        description="기준 시각 'HH:MM'(15분 단위). 이 시각 이후(미래) 슬롯은 응답에서 제외한다. "
-                    "생략하면 서버의 현재 시:분을 date에 붙여서 자른다(날짜와 무관하게 항상 "
-                    "00:00~그 시:분까지만 나오며, 하루 전체가 새는 일은 없다).",
-    ),
-):
-    """meter_timeseries와 동일하나 store_id(상가 기준)로 조회한다."""
+def store_timeseries(body: StoreTimeseriesRequest):
+    """
+    store_id를 body로 받는다(URL에 store_id를 노출하지 않으려고 POST를 씀).
+    meter_timeseries와 동일하나 store_id(상가 기준)로 조회한다.
+    """
     try:
-        result = get_store_day_series(_engine, store_id, date, parse_snapshot_time(time) if time else None)
+        result = get_store_day_series(
+            _engine, body.store_id, body.date, parse_snapshot_time(body.time) if body.time else None
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {
-        "store_id": store_id,
+        "store_id": body.store_id,
         "meter_id": result.meter_id,
         "date": result.target_date.isoformat(),
         "is_synthetic": result.is_synthetic,

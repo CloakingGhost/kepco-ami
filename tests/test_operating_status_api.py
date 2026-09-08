@@ -2,9 +2,12 @@
 """
 1순위 기능(영업유무·혼잡도) API 4개 엔드포인트 검증:
   - GET /api/stores/status
-  - GET /api/stores/{store_id}/status/current
-  - GET /api/stores/{store_id}/hours
-  - GET /api/stores/{store_id}/status
+  - POST /api/stores/status/current (store_id는 body)
+  - POST /api/stores/hours (store_id는 body)
+  - POST /api/stores/status/day (store_id는 body)
+
+store_id를 URL에 노출하지 않으려고 세 엔드포인트 모두 POST + body로 받는다
+(POST /api/stores의 상세조회와 동일한 패턴).
 
 시나리오 표는 db/tests/README에 두지 않고(요청받지 않았으므로) 이 파일의 각 테스트
 docstring/이름에 그대로 옮겨 적는다. 화곡동 파일럿 21개 매장(match_status='matched')만
@@ -65,13 +68,13 @@ class TestListCurrentStatus:
 
 
 # ============================================================
-# GET /api/stores/{store_id}/status/current - 매장 1곳 현재 상태
+# POST /api/stores/status/current - 매장 1곳 현재 상태 (store_id는 body)
 # ============================================================
 
 class TestStoreCurrentStatus:
     def test_normal_valid_store_id(self, client):
         """정상: store_id=1 -> 200, store_id/name 일치, congestion_level 규칙 일치."""
-        resp = client.get(f"/api/stores/{VALID_STORE_ID}/status/current")
+        resp = client.post("/api/stores/status/current", json={"store_id": VALID_STORE_ID})
         assert resp.status_code == 200
         body = resp.json()
         assert body["store_id"] == VALID_STORE_ID
@@ -84,23 +87,23 @@ class TestStoreCurrentStatus:
 
     def test_boundary_nonexistent_store_id_returns_404(self, client):
         """경계: 존재하지 않는 store_id(999) -> 404."""
-        resp = client.get(f"/api/stores/{NONEXISTENT_STORE_ID}/status/current")
+        resp = client.post("/api/stores/status/current", json={"store_id": NONEXISTENT_STORE_ID})
         assert resp.status_code == 404
 
     def test_boundary_store_id_zero_returns_404(self, client):
         """경계: store_id=0(범위 1~21 밖, 그러나 타입은 유효한 int) -> 404."""
-        resp = client.get("/api/stores/0/status/current")
+        resp = client.post("/api/stores/status/current", json={"store_id": 0})
         assert resp.status_code == 404
 
 
 # ============================================================
-# GET /api/stores/{store_id}/hours - 매장 1곳 요일별 운영시간
+# POST /api/stores/hours - 매장 1곳 요일별 운영시간 (store_id는 body)
 # ============================================================
 
 class TestStoreHours:
     def test_normal_valid_store_id(self, client):
         """정상: store_id=1 -> 200, 1~7행, day_of_week 0~6 중복 없이, source 값 유효."""
-        resp = client.get(f"/api/stores/{VALID_STORE_ID}/hours")
+        resp = client.post("/api/stores/hours", json={"store_id": VALID_STORE_ID})
         assert resp.status_code == 200
         body = resp.json()
         assert body["store_id"] == VALID_STORE_ID
@@ -119,12 +122,12 @@ class TestStoreHours:
 
     def test_boundary_nonexistent_store_id_returns_404(self, client):
         """경계: 존재하지 않는 store_id(999) -> 404."""
-        resp = client.get(f"/api/stores/{NONEXISTENT_STORE_ID}/hours")
+        resp = client.post("/api/stores/hours", json={"store_id": NONEXISTENT_STORE_ID})
         assert resp.status_code == 404
 
 
 # ============================================================
-# GET /api/stores/{store_id}/status - 매장 1곳 하루 상태+전력 타임라인
+# POST /api/stores/status/day - 매장 1곳 하루 상태+전력 타임라인 (store_id는 body)
 # ============================================================
 
 class TestStoreStatusDay:
@@ -138,9 +141,9 @@ class TestStoreStatusDay:
 
     def test_normal_real_segment(self, client):
         """정상(실측 구간): store_id=1, date=2026-05-15, time=23:45 -> 200, 96행, is_synthetic 전부 false."""
-        resp = client.get(
-            f"/api/stores/{VALID_STORE_ID}/status",
-            params={"date": REAL_DATE.isoformat(), "time": "23:45"},
+        resp = client.post(
+            "/api/stores/status/day",
+            json={"store_id": VALID_STORE_ID, "date": REAL_DATE.isoformat(), "time": "23:45"},
         )
         assert resp.status_code == 200
         body = resp.json()
@@ -153,9 +156,9 @@ class TestStoreStatusDay:
 
     def test_normal_synthetic_segment(self, client):
         """정상(합성 구간): store_id=1, date=2026-08-15, time=23:45 -> 200, 96행, is_synthetic 전부 true."""
-        resp = client.get(
-            f"/api/stores/{VALID_STORE_ID}/status",
-            params={"date": SYNTHETIC_DATE.isoformat(), "time": "23:45"},
+        resp = client.post(
+            "/api/stores/status/day",
+            json={"store_id": VALID_STORE_ID, "date": SYNTHETIC_DATE.isoformat(), "time": "23:45"},
         )
         assert resp.status_code == 200
         body = resp.json()
@@ -166,9 +169,9 @@ class TestStoreStatusDay:
 
     def test_normal_1hour_resolution_store_has_fewer_rows(self, client):
         """정상(1hour 계기 매장): store_id=2, date=2026-08-15, time=23:45 -> 200, data_resolution='1hour', rows<96."""
-        resp = client.get(
-            f"/api/stores/{ONE_HOUR_STORE_ID}/status",
-            params={"date": SYNTHETIC_DATE.isoformat(), "time": "23:45"},
+        resp = client.post(
+            "/api/stores/status/day",
+            json={"store_id": ONE_HOUR_STORE_ID, "date": SYNTHETIC_DATE.isoformat(), "time": "23:45"},
         )
         assert resp.status_code == 200
         body = resp.json()
@@ -185,7 +188,7 @@ class TestStoreStatusDay:
         """
         from ami_db.serving import service_now
 
-        resp = client.get(f"/api/stores/{VALID_STORE_ID}/status", params={"date": REAL_DATE.isoformat()})
+        resp = client.post("/api/stores/status/day", json={"store_id": VALID_STORE_ID, "date": REAL_DATE.isoformat()})
         assert resp.status_code == 200
         rows = resp.json()["rows"]
         cutoff_time_str = service_now().strftime("%H:%M")
@@ -205,27 +208,29 @@ class TestStoreStatusDay:
         None을 리턴하도록 고쳐, app/serving_api.py의 store_status_day()가 이를
         404로 매핑하도록 수정했다.
         """
-        resp = client.get(
-            f"/api/stores/{NONEXISTENT_STORE_ID}/status", params={"date": SYNTHETIC_DATE.isoformat()}
+        resp = client.post(
+            "/api/stores/status/day",
+            json={"store_id": NONEXISTENT_STORE_ID, "date": SYNTHETIC_DATE.isoformat()},
         )
         assert resp.status_code == 404
 
     def test_boundary_date_before_earliest_sample_date_returns_400(self, client):
         """경계: EARLIEST_SAMPLE_DATE(2026-04-01) 이전 날짜 -> 400."""
         before = EARLIEST_SAMPLE_DATE - timedelta(days=1)
-        resp = client.get(f"/api/stores/{VALID_STORE_ID}/status", params={"date": before.isoformat()})
+        resp = client.post("/api/stores/status/day", json={"store_id": VALID_STORE_ID, "date": before.isoformat()})
         assert resp.status_code == 400
 
     def test_boundary_date_after_service_range_returns_400(self, client):
         """경계: LATEST_SERVICE_DATE(2026-07-31) 다음날 -> 400."""
         after = LATEST_SERVICE_DATE + timedelta(days=1)
-        resp = client.get(f"/api/stores/{VALID_STORE_ID}/status", params={"date": after.isoformat()})
+        resp = client.post("/api/stores/status/day", json={"store_id": VALID_STORE_ID, "date": after.isoformat()})
         assert resp.status_code == 400
 
     def test_boundary_date_equal_to_service_end_is_valid(self, client):
         """경계: LATEST_SERVICE_DATE 자체(범위의 상한, inclusive) -> 200."""
-        resp = client.get(
-            f"/api/stores/{VALID_STORE_ID}/status", params={"date": LATEST_SERVICE_DATE.isoformat()}
+        resp = client.post(
+            "/api/stores/status/day",
+            json={"store_id": VALID_STORE_ID, "date": LATEST_SERVICE_DATE.isoformat()},
         )
         assert resp.status_code == 200
         body = resp.json()
@@ -240,7 +245,7 @@ class TestStoreStatusDay:
         congestion_level은 문자열('상'/'중'/'하'/null)이 아니라 정수 코드
         (0=해당없음/1=여유/2=보통/3=혼잡)로 내려간다 - 스냅샷/상세 API와 같은 인코딩.
         """
-        resp = client.get(f"/api/stores/{VALID_STORE_ID}/status", params={"date": REAL_DATE.isoformat()})
+        resp = client.post("/api/stores/status/day", json={"store_id": VALID_STORE_ID, "date": REAL_DATE.isoformat()})
         assert resp.status_code == 200
         rows = resp.json()["rows"]
         assert len(rows) > 0
