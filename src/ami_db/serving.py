@@ -674,3 +674,88 @@ def get_anomalies(
         total = int(conn.execute(count_query, count_params).scalar_one())
         df = pd.read_sql(query, conn, params=params)
     return _records(df), total
+
+
+# "주의반복" 판정 창(시간) - 하루 주기로 설계된 판정 로직(요일x슬롯 baseline)과 결을
+# 맞추고, 몇 주짜리 완만한 추세가 아니라 "하루 사이에 계속 이상하다"는 급한 신호만
+# 잡기 위해 24시간으로 잡았다.
+CAUTION_REPEAT_WINDOW_HOURS = 24
+# 최근 창 안에 서로 다른 사건(episode)이 몇 번 있어야 "반복"으로 볼지.
+CAUTION_REPEAT_THRESHOLD = 3
+# 같은 사건(episode)으로 묶을 최대 간격(분) - 그리드 한 칸(15분)을 넘으면 별개 사건으로
+# 취급한다. anomaly_events는 슬롯 1개당 1행이라 사건 하나(예: 60분 지속)도 이미 여러
+# 행으로 남으므로, 원시 행 개수가 아니라 이 간격 기준으로 묶은 사건 개수를 세야 한다
+# (db/docs/안전감지_이상치_판정기준.md 8절 한계 2).
+EPISODE_GAP_MINUTES = 15
+
+
+def get_anomaly_snapshot(engine: Engine, date_str: str | None, time_str: str | None) -> dict:
+    """
+    화면 표시용 위기 감지 스냅샷 (`GET /api/anomalies/snapshot`). date/time을 둘 다
+    생략하면 서버의 "현재" 기준(service_now())으로, 하나만 주면 나머지는 현재값으로
+    채워서 특정 시점을 본다 - get_stores_snapshot과 달리 이 엔드포인트는 date/time이
+    선택값이라는 점이 다르다(그쪽은 둘 다 필수).
+
+    화면에 띄울 두 가지 상황을 한 응답에 합친다:
+      1) 즉시위험: 조회 시점의 슬롯에 '위험' 이벤트가 있는 매장
+      2) 주의반복: 조회 시점 기준 최근 CAUTION_REPEAT_WINDOW_HOURS 안에 서로 다른
+         '주의' 사건이 CAUTION_REPEAT_THRESHOLD번 이상 있는 매장
+
+    두 상황에 모두 안 걸리는 매장(대부분)은 응답에 아예 나오지 않는다 - "지금 화면에
+    띄울 것만" 요구사항 그대로, 21개 매장 전체를 '일반' 포함해서 나열하지 않는다.
+    """
+    now = service_now()
+    target_date = parse_service_date(date_str) if date_str else now.date()
+    target_time = parse_snapshot_time(time_str) if time_str else now.time()
+    reference_ts = datetime.combine(target_date, target_time)
+    window_start = reference_ts - timedelta(hours=CAUTION_REPEAT_WINDOW_HOURS)
+
+    query = text(
+        """
+        SELECT s.store_id, ae.meter_id, s.name AS store_name, ae.detected_at, ae.level,
+               ae.rule_triggered, ae.metric_value, ae.threshold_value
+        FROM anomaly_events ae
+        JOIN stores s ON s.meter_id = ae.meter_id
+        WHERE ae.detected_at > :window_start AND ae.detected_at <= :reference_ts
+        ORDER BY s.store_id, ae.detected_at
+        """
+    )
+    with engine.connect() as conn:
+        df = pd.read_sql(query, conn, params={"window_start": window_start, "reference_ts": reference_ts})
+
+    alerts: list[dict] = []
+    if not df.empty:
+        danger_now = df[(df["level"] == "위험") & (df["detected_at"] == reference_ts)]
+        for row in danger_now.itertuples(index=False):
+            alerts.append({
+                "store_id": int(row.store_id), "store_name": row.store_name, "meter_id": row.meter_id,
+                "level": "위험", "trigger_reason": "즉시위험", "rule_triggered": row.rule_triggered,
+                "detected_at": row.detected_at, "metric_value": float(row.metric_value),
+                "threshold_value": float(row.threshold_value), "repeat_count": None,
+            })
+
+        gap = timedelta(minutes=EPISODE_GAP_MINUTES)
+        caution = df[df["level"] == "주의"].sort_values(["store_id", "detected_at"])
+        for store_id, group in caution.groupby("store_id"):
+            detected_ats = group["detected_at"].tolist()
+            episode_count = 1
+            for i in range(1, len(detected_ats)):
+                if detected_ats[i] - detected_ats[i - 1] > gap:
+                    episode_count += 1
+            if episode_count < CAUTION_REPEAT_THRESHOLD:
+                continue
+            last = group.iloc[-1]
+            alerts.append({
+                "store_id": int(store_id), "store_name": last["store_name"], "meter_id": last["meter_id"],
+                "level": "주의", "trigger_reason": "주의반복", "rule_triggered": last["rule_triggered"],
+                "detected_at": last["detected_at"], "metric_value": float(last["metric_value"]),
+                "threshold_value": float(last["threshold_value"]), "repeat_count": episode_count,
+            })
+
+    alerts.sort(key=lambda a: (0 if a["trigger_reason"] == "즉시위험" else 1, a["store_id"]))
+    return {
+        "date": target_date.strftime("%y-%m-%d"),
+        "time": target_time.strftime("%H:%M"),
+        "count": len(alerts),
+        "alerts": alerts,
+    }

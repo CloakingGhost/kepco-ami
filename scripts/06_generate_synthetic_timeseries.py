@@ -59,6 +59,33 @@ MANUAL_SCENARIOS = [
         "kind": "continuous_load",
         "detail": "계약전력 95%를 3시간 지속 - 연속부하 80% 규칙 초과(사고 충분조건)",
     },
+    # "주의반복"(하루 3회) 화면 표시 데모용 - A-L-63(소문난순대, 계약 13kW)에 새벽
+    # 01/03/05시 세 번, 각 60분씩 별도 사건을 심는다. load_ratio=0.25는 매장 자신의
+    # baseline+3x floor(약 0.648kWh)는 넉넉히 넘지만 계약전력 80%/130% 근처는 전혀
+    # 아니므로 empty_store_baseline_3x_60min(주의)만 걸리고 continuous_load/danger는
+    # 걸리지 않는다(3-1절 baseline 표 근거). 기존 A-L-60/A-L-65 시나리오와는 날짜가
+    # 겹치지 않는다.
+    {
+        "meter_id": "A-L-63", "date": date(2026, 7, 22),  # 수요일
+        "start_slot": 4, "duration_slots": 4,              # 01:00~01:45 = 60분 (1/3)
+        "load_ratio": 0.25,
+        "kind": "caution_repeat_1",
+        "detail": "매장 자체 baseline+3x floor를 60분 지속 초과 - 주의반복 데모 1/3",
+    },
+    {
+        "meter_id": "A-L-63", "date": date(2026, 7, 22),
+        "start_slot": 12, "duration_slots": 4,             # 03:00~03:45 = 60분 (2/3)
+        "load_ratio": 0.25,
+        "kind": "caution_repeat_2",
+        "detail": "매장 자체 baseline+3x floor를 60분 지속 초과 - 주의반복 데모 2/3",
+    },
+    {
+        "meter_id": "A-L-63", "date": date(2026, 7, 22),
+        "start_slot": 20, "duration_slots": 4,             # 05:00~05:45 = 60분 (3/3)
+        "load_ratio": 0.25,
+        "kind": "caution_repeat_3",
+        "detail": "매장 자체 baseline+3x floor를 60분 지속 초과 - 주의반복 데모 3/3",
+    },
 ]
 
 

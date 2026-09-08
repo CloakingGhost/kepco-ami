@@ -290,6 +290,39 @@ class AnomalyListResponse(BaseModel):
     anomalies: list[AnomalySchema] = Field(description="이번 페이지의 이벤트(최신순)")
 
 
+class AnomalySnapshotAlert(BaseModel):
+    store_id: int = Field(examples=[12], description="stores.store_id")
+    store_name: str | None = Field(default=None, examples=["충북식당"])
+    meter_id: str = Field(examples=["A-L-60"])
+    level: str = Field(examples=["위험"], description="'주의' | '위험'")
+    trigger_reason: str = Field(
+        examples=["즉시위험"],
+        description="'즉시위험'(조회 시점 슬롯에 위험 이벤트 존재) | "
+                    "'주의반복'(최근 24시간 내 서로 다른 주의 사건이 3회 이상)",
+    )
+    rule_triggered: str = Field(
+        examples=["kec212_overload_130pct_60min"],
+        description="가장 최근에 발동한 규칙. 상세는 db/docs/안전감지_이상치_판정기준.md 참고.",
+    )
+    detected_at: datetime = Field(description="'즉시위험'은 조회 시점 슬롯, '주의반복'은 최근 사건의 슬롯")
+    metric_value: float = Field(description="detected_at 시점에 실제 관측된 유효전력(kWh, 15분 슬롯 값)")
+    threshold_value: float = Field(description="그 규칙이 넘어섰다고 판정한 임계치(kWh, 15분 슬롯 값)")
+    repeat_count: int | None = Field(
+        default=None,
+        description="'주의반복'일 때만 값이 있음 - 최근 24시간 내 서로 다른 주의 사건(episode) 개수. "
+                    "슬롯(15분) 원시 행 개수가 아니다(사건 하나도 여러 슬롯에 걸쳐 여러 행으로 남으므로).",
+    )
+
+
+class AnomalySnapshotResponse(BaseModel):
+    date: str = Field(examples=["26-07-02"], description="조회 기준 날짜 'YY-MM-DD'. 생략 시 서버 현재 날짜")
+    time: str = Field(examples=["02:15"], description="조회 기준 시각 'HH:MM'. 생략 시 서버 현재 시:분(15분 단위로 내림)")
+    count: int = Field(examples=[1], description="alerts 배열 길이")
+    alerts: list[AnomalySnapshotAlert] = Field(
+        description="화면에 표시해야 할 매장 목록. 위험/주의 어느 쪽에도 안 걸리는 매장(대부분)은 나오지 않는다.",
+    )
+
+
 class TimeseriesRow(BaseModel):
     ts: datetime
     received_active_power_kwh: float | None = None

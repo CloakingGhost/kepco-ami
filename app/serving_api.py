@@ -35,6 +35,7 @@ from ami_db.serving import (  # noqa: E402
     LATEST_SNAPSHOT_DATE,
     get_all_stores,
     get_anomalies,
+    get_anomaly_snapshot,
     get_current_status_all,
     get_current_status_one,
     get_meter_day_series,
@@ -47,6 +48,7 @@ from ami_db.serving import (  # noqa: E402
 )
 from app.schemas import (  # noqa: E402
     AnomalyListResponse,
+    AnomalySnapshotResponse,
     CurrentStatusListResponse,
     CurrentStatusOneSchema,
     DayStatusResponse,
@@ -80,6 +82,7 @@ _engine = get_engine()
 # body 스키마 쪽(app/schemas.py)에 있으므로 여기서는 anomalies 필터에서만 쓰는 값만 남긴다.
 EXAMPLE_DANGER_METER_ID = "A-L-60"          # 7월 '위험' 시나리오가 심긴 계기(충북식당)
 EXAMPLE_CAUTION_METER_ID = "A-L-65"         # 7월 '주의' 시나리오가 심긴 계기(와카츠)
+EXAMPLE_REPEAT_METER_ID = "A-L-63"          # 7월 '주의반복'(하루 3회) 시나리오가 심긴 계기(소문난순대)
 
 
 @app.get("/health", tags=["기본"], summary="헬스체크")
@@ -189,7 +192,6 @@ def stores_snapshot(
 @app.post(
     "/api/stores/status/current", tags=["영업유무·혼잡도"], summary="매장 1곳 현재 상태",
     response_model=CurrentStatusOneSchema,
-    include_in_schema=False
 )
 def store_current_status(body: StoreIdRequest):
     """
@@ -206,7 +208,6 @@ def store_current_status(body: StoreIdRequest):
 @app.post(
     "/api/stores/hours", tags=["영업유무·혼잡도"], summary="매장 1곳의 요일별 운영시간",
     response_model=StoreHoursResponse,
-    include_in_schema=False
 )
 def store_hours(body: StoreIdRequest):
     """
@@ -224,7 +225,6 @@ def store_hours(body: StoreIdRequest):
 @app.post(
     "/api/stores/status/day", tags=["영업유무·혼잡도"], summary="매장 1곳의 하루 상태+전력 타임라인",
     response_model=DayStatusResponse,
-    include_in_schema=False
 )
 def store_status_day(body: StoreStatusDayRequest):
     """
@@ -313,10 +313,57 @@ def list_anomalies(
     return {"total": total, "limit": limit, "offset": offset, "anomalies": rows}
 
 
+@app.get(
+    "/api/anomalies/snapshot", tags=["안전감지"], summary="특정 시점 위기 감지 스냅샷 (화면 표시용)",
+    response_model=AnomalySnapshotResponse,
+)
+def anomalies_snapshot(
+    date: str | None = Query(
+        default=None,
+        description=f"조회할 날짜, 'YY-MM-DD' 형식(연도 2자리). 범위: "
+                    f"{EARLIEST_SAMPLE_DATE.strftime('%y-%m-%d')} ~ {LATEST_SERVICE_DATE.strftime('%y-%m-%d')}. "
+                    "생략하면 time과 무관하게 서버의 현재 날짜를 쓴다.",
+        openapi_examples={
+            "현재": {"summary": "생략 (서버 현재 시각 기준)", "value": None},
+            "위험 데모": {"summary": f"{EXAMPLE_DANGER_METER_ID} 위험 시나리오 당일", "value": "26-07-02"},
+            "주의반복 데모": {"summary": f"{EXAMPLE_REPEAT_METER_ID} 주의반복 시나리오 당일", "value": "26-07-22"},
+        },
+    ),
+    time: str | None = Query(
+        default=None,
+        description="조회할 시각, 'HH:MM' 형식(00:00~23:45, 15분 단위만 허용: 00/15/30/45). "
+                    "생략하면 date와 무관하게 서버의 현재 시:분(15분 단위로 내림)을 쓴다.",
+        openapi_examples={
+            "현재": {"summary": "생략 (서버 현재 시각 기준)", "value": None},
+            "위험 데모": {"summary": "위험 시나리오 지속 구간 한가운데", "value": "02:15"},
+            "주의반복 데모": {"summary": "3번째 반복 사건 종료 직후", "value": "06:00"},
+        },
+    ),
+):
+    """
+    화면에 즉시 띄울 매장만 골라 돌려주는 스냅샷 API - 관리자용 전체 이력 조회(`GET /api/anomalies`)와
+    달리, 아래 두 상황 중 하나에 걸린 매장만 `alerts`에 담는다. 둘 다 아니면(대부분의 매장·시각)
+    응답은 `count=0`, `alerts=[]`다.
+
+    1. **즉시위험**: 조회 시점의 슬롯에 `위험` 이벤트가 있는 매장(`kec212_overload_130pct_60min`).
+    2. **주의반복**: 조회 시점 기준 최근 24시간 안에 서로 다른 `주의` 사건(슬롯 간격이 15분을
+       넘으면 별개 사건으로 취급)이 3번 이상 있는 매장. 사건 하나가 이미 여러 슬롯(행)에 걸치므로
+       원시 행 개수가 아니라 사건 개수로 센다 - 자세한 근거는 `db/docs/안전감지_이상치_판정기준.md` 참고.
+
+    date/time을 둘 다 생략하면 서버 "현재" 기준(`ami_db.serving.service_now`)으로 조회한다 -
+    단, 실측 데이터는 2026-06-30에서 끝나고 위험/주의 데모는 7월 합성 구간에만 있으므로, 데모
+    확인 목적이라면 위 예시값(위험: 26-07-02 02:15, 주의반복: 26-07-22 06:00)으로 직접 지정해서
+    호출해야 한다.
+    """
+    try:
+        return get_anomaly_snapshot(_engine, date, time)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @app.post(
     "/api/meters/timeseries", tags=["원시 전력값"], summary="계기 1곳의 하루 원시 전력값",
     response_model=MeterTimeseriesResponse,
-    include_in_schema=False
 )
 def meter_timeseries(body: MeterTimeseriesRequest):
     """

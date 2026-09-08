@@ -3,7 +3,7 @@
 > 이 문서는 `scripts/generate_api_docs.py`가 FastAPI OpenAPI 스키마에서 **자동 생성**했습니다.
 > 코드(엔드포인트·모델)를 고쳤다면 재생성하세요: `uv run python scripts/generate_api_docs.py`
 >
-> 버전: `0.1.0` · 생성 시각: `2026-09-08 15:07 UTC`
+> 버전: `0.1.0` · 생성 시각: `2026-09-08 19:31 UTC`
 
 **Base URL(로컬)**: `http://localhost:8000`  (Swagger UI: `http://localhost:8000/docs`)
 
@@ -327,6 +327,58 @@ store_id 범위를 벗어나면 404, date/time이 조회 가능 범위 밖이면
 | `metric_value` | `number` | 실제 관측된 유효전력(kWh, 15분 슬롯 값) |
 | `threshold_value` | `number` | 그 규칙이 넘어섰다고 판정한 임계치(kWh, 15분 슬롯 값) |
 | `notified_at` | `string \| null` | 알림 발송 연동은 이번 범위 밖이라 항상 null |
+
+</details>
+
+---
+
+### `GET /api/anomalies/snapshot`
+**특정 시점 위기 감지 스냅샷 (화면 표시용)**
+
+화면에 즉시 띄울 매장만 골라 돌려주는 스냅샷 API - 관리자용 전체 이력 조회(`GET /api/anomalies`)와
+달리, 아래 두 상황 중 하나에 걸린 매장만 `alerts`에 담는다. 둘 다 아니면(대부분의 매장·시각)
+응답은 `count=0`, `alerts=[]`다.
+
+1. **즉시위험**: 조회 시점의 슬롯에 `위험` 이벤트가 있는 매장(`kec212_overload_130pct_60min`).
+2. **주의반복**: 조회 시점 기준 최근 24시간 안에 서로 다른 `주의` 사건(슬롯 간격이 15분을
+   넘으면 별개 사건으로 취급)이 3번 이상 있는 매장. 사건 하나가 이미 여러 슬롯(행)에 걸치므로
+   원시 행 개수가 아니라 사건 개수로 센다 - 자세한 근거는 `db/docs/안전감지_이상치_판정기준.md` 참고.
+
+date/time을 둘 다 생략하면 서버 "현재" 기준(`ami_db.serving.service_now`)으로 조회한다 -
+단, 실측 데이터는 2026-06-30에서 끝나고 위험/주의 데모는 7월 합성 구간에만 있으므로, 데모
+확인 목적이라면 위 예시값(위험: 26-07-02 02:15, 주의반복: 26-07-22 06:00)으로 직접 지정해서
+호출해야 한다.
+
+**파라미터**
+
+| 이름 | 위치 | 타입 | 필수 | 예시 | 설명 |
+|---|---|---|:---:|---|---|
+| `date` | query | `string` |  |  | 조회할 날짜, 'YY-MM-DD' 형식(연도 2자리). 범위: 26-04-01 ~ 26-07-31. 생략하면 time과 무관하게 서버의 현재 날짜를 쓴다. |
+| `time` | query | `string` |  |  | 조회할 시각, 'HH:MM' 형식(00:00~23:45, 15분 단위만 허용: 00/15/30/45). 생략하면 date와 무관하게 서버의 현재 시:분(15분 단위로 내림)을 쓴다. |
+
+**응답 (200)** — `AnomalySnapshotResponse`
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `date` | `string` | 조회 기준 날짜 'YY-MM-DD'. 생략 시 서버 현재 날짜 |
+| `time` | `string` | 조회 기준 시각 'HH:MM'. 생략 시 서버 현재 시:분(15분 단위로 내림) |
+| `count` | `integer` | alerts 배열 길이 |
+| `alerts` | `AnomalySnapshotAlert[]` | 화면에 표시해야 할 매장 목록. 위험/주의 어느 쪽에도 안 걸리는 매장(대부분)은 나오지 않는다. |
+
+<details><summary><code>AnomalySnapshotAlert</code> 필드 상세</summary>
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `store_id` | `integer` | stores.store_id |
+| `store_name` | `string \| null` |  |
+| `meter_id` | `string` |  |
+| `level` | `string` | '주의' | '위험' |
+| `trigger_reason` | `string` | '즉시위험'(조회 시점 슬롯에 위험 이벤트 존재) | '주의반복'(최근 24시간 내 서로 다른 주의 사건이 3회 이상) |
+| `rule_triggered` | `string` | 가장 최근에 발동한 규칙. 상세는 db/docs/안전감지_이상치_판정기준.md 참고. |
+| `detected_at` | `string` | '즉시위험'은 조회 시점 슬롯, '주의반복'은 최근 사건의 슬롯 |
+| `metric_value` | `number` | detected_at 시점에 실제 관측된 유효전력(kWh, 15분 슬롯 값) |
+| `threshold_value` | `number` | 그 규칙이 넘어섰다고 판정한 임계치(kWh, 15분 슬롯 값) |
+| `repeat_count` | `integer \| null` | '주의반복'일 때만 값이 있음 - 최근 24시간 내 서로 다른 주의 사건(episode) 개수. 슬롯(15분) 원시 행 개수가 아니다(사건 하나도 여러 슬롯에 걸쳐 여러 행으로 남으므로). |
 
 </details>
 
