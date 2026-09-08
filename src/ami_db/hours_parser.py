@@ -60,7 +60,7 @@ class HoursRow:
     raw_text: str | None = None
 
 
-def _to_24h(period: str, hour: str, minute: str) -> tuple[int, int]:
+def _to_24h(period: str | None, hour: str, minute: str) -> tuple[int, int]:
     h, m = int(hour), int(minute)
     if period == "오후" and h != 12:
         h += 12
@@ -69,16 +69,41 @@ def _to_24h(period: str, hour: str, minute: str) -> tuple[int, int]:
     return h, m
 
 
+def _fill_omitted_markers(matches: list[tuple[str, str, str]]) -> list[tuple[str, str, str]]:
+    """
+    Google 원문은 같은 오전/오후 구간 안에서 두 번째(종료) 마커를 생략하는 경우가 있다
+    (실측 확인: "오후 2:00~9:00" == "오후 2:00 ~ 오후 9:00"의 축약, "~"에 공백도 없는
+    압축 표기). 마커가 빈 시각은 바로 앞에서 명시된 마커를 그대로 물려받는다 - 이걸
+    안 하면 "9:00"을 마커 없는 24시간제로 오인해 21:00(오후 9시)이 09:00(오전 9시)이 돼
+    "14:00~09:00"처럼 실제로는 저녁 7시간 영업인 매장이 19시간 철야 영업으로 뒤집힌다.
+    """
+    filled = []
+    last_period = None
+    for period, hour, minute in matches:
+        period = period or last_period
+        if period:
+            last_period = period
+        filled.append((period, hour, minute))
+    return filled
+
+
 def _parse_range(text: str) -> tuple[time, time] | None:
     """
     '11:00-22:00'(KSIC 추정, 24시간제) / '오전 11:30 ~ 오후 10:00'(Google Places 실측,
     12시간제+오전오후) 두 형식 모두 -> (open_time, close_time)로 정규화한다.
+
+    쉼표로 나뉜 여러 구간("오전 11:00 ~ 오후 3:30, 오후 5:00~9:00" 같은 점심/저녁
+    분리 영업)이 있으면 첫 시작~마지막 종료로 넓게 잡는다(중간 휴게시간을 영업 중으로
+    보수적으로 처리) - 두 번째 구간을 통째로 버려서 실제 저녁 영업시간을 '영업종료'로
+    오판하면 안전감지가 정상 영업 전력을 이상치로 잘못 잡을 위험이 있는데, 반대로
+    휴게시간을 영업 중으로 넓게 잡아도 그 시간대는 안전감지 판정 대상에서 빠질 뿐이라
+    더 안전한 쪽으로 치우친다.
     """
-    matches = _TIME_RE.findall(text)
+    matches = _fill_omitted_markers(_TIME_RE.findall(text))
     if len(matches) < 2:
         return None
     open_h, open_m = _to_24h(*matches[0])
-    close_h, close_m = _to_24h(*matches[1])
+    close_h, close_m = _to_24h(*matches[-1])
     # close_time이 24:00(또는 그 이상)으로 오는 경우 time()이 받아들이지 못하므로 23:59로 보정
     # (AMI 원본 시계열의 24:00 보정과 동일한 이유 - 01_prepare_data.py의 fix_2400() 참고).
     close_t = time(23, 59) if close_h >= 24 else time(close_h, close_m)

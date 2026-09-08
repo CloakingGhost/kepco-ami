@@ -106,6 +106,23 @@ def _upsert_google_hours(conn, store_id: int, rows: list[HoursRow]) -> None:
     )
 
 
+def reload_cached_hours(conn, store_id: int, hours_raw: list[str]) -> list[HoursRow] | None:
+    """
+    이미 google_places_cache에 저장된 hours_raw(원문 배열)를 Google을 다시 호출하지
+    않고 hours_parser로 재파싱해 store_operating_hours만 다시 upsert한다.
+    hours_parser.py의 파싱 규칙이 바뀌었을 때(예: 오전/오후 마커 생략 처리 수정)
+    이미 캐싱된 원문으로 재계산하는 용도 - scripts/17_reparse_operating_hours.py 전용.
+
+    Returns: 재파싱해 반영한 HoursRow 7개, hours_raw가 "정보 없음"뿐이면 None
+        (아무것도 건드리지 않는다 - ksic_estimate 폴백이 그대로 유효하기 때문).
+    """
+    if is_no_info(hours_raw):
+        return None
+    rows = parse_places_hours_lines(hours_raw)
+    _upsert_google_hours(conn, store_id, rows)
+    return rows
+
+
 def get_or_fetch_store_hours(
     client: GooglePlacesClient, conn, store_id: int, store_name: str, location: str,
 ) -> list[HoursRow] | None:
