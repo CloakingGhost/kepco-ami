@@ -323,6 +323,53 @@ class AnomalySnapshotResponse(BaseModel):
     )
 
 
+class AnomalyExplainRequest(BaseModel):
+    store_id: int = Field(examples=[12], description="상가 ID (1~21). body로 받는 이유는 URL에 store_id를 노출하지 않기 위함")
+    detected_at: datetime = Field(
+        examples=["2026-07-02T02:15:00"],
+        description="설명할 이벤트의 감지 시각(15분 슬롯). GET /api/anomalies/snapshot 응답의 "
+                    "detected_at을 그대로 넘기면 된다. 해당 이벤트가 없으면 404.",
+    )
+
+
+class AnomalyExplainResponse(BaseModel):
+    store_id: int = Field(examples=[12])
+    store_name: str | None = Field(default=None, examples=["충북식당"])
+    detected_at: datetime
+    level: str = Field(examples=["위험"], description="'주의' | '위험' - 규칙이 이미 확정한 등급(LLM이 바꾸지 않음)")
+    rule_triggered: str = Field(examples=["kec212_overload_130pct_60min"])
+    owner_sms: str = Field(
+        examples=["충북식당 점주님, 현재 전력 사용량이 계약 전력의 130%를 초과하고 있습니다. ..."],
+        description="점주에게 보낼 문자 초안(2~3문장, 존댓말)",
+    )
+    admin_note: str = Field(
+        examples=["KEC 212.3 산업용 배선차단기 기준에 따라 계약전력 130%가 60분 지속된 것으로 확인됨."],
+        description="관리자용 점검 사유(1~2문장, 발동 규칙과 근거 수치 명시)",
+    )
+    emergency_report: str | None = Field(
+        default=None,
+        description="신고 접수용 초안. level='위험'일 때만 채워지고 '주의'면 null.",
+    )
+    verification_passed: bool = Field(
+        examples=[True],
+        description="생성문에 입력에 없던 숫자가 섞였는지 자동 대조한 결과. false면 환각 의심 - "
+                    "unknown_numbers에 그 숫자가 담긴다. 판정 로직이 아니라 LLM 출력 검사다.",
+    )
+    unknown_numbers: list[str] = Field(
+        default_factory=list,
+        examples=[[]],
+        description="입력 수치와 대조되지 않은 숫자 목록. 비어 있으면 통과.",
+    )
+    model: str = Field(examples=["mistralai/mistral-nemotron"], description="생성에 사용한 모델")
+    elapsed_ms: int = Field(examples=[2800], description="LLM 호출 소요 시간(ms)")
+    source: str = Field(
+        examples=["live"],
+        description="'live'=이번 호출로 생성 | 'cache'=외부 LLM API 장애로 이전 생성분을 재사용. "
+                    "호스팅 모델이 예고 없이 응답 불능이 되는 것을 실측했기 때문에 둔 방어 장치이며, "
+                    "캐시본을 쓴 사실을 숨기지 않는다.",
+    )
+
+
 class TimeseriesRow(BaseModel):
     ts: datetime
     received_active_power_kwh: float | None = None

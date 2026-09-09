@@ -759,3 +759,33 @@ def get_anomaly_snapshot(engine: Engine, date_str: str | None, time_str: str | N
         "count": len(alerts),
         "alerts": alerts,
     }
+
+
+def get_anomaly_event(engine: Engine, store_id: int, detected_at: datetime) -> dict | None:
+    """
+    설명문 생성(ami_db.narrate)에 넣을 이벤트 1건을 DB에서 그대로 읽어온다.
+
+    클라이언트가 보낸 수치를 LLM에 그대로 먹이지 않으려고 별도 조회를 둔다 - 관측값이나
+    임계값을 임의로 바꿔 보낼 수 있으면 "AI가 쓴 설명"의 근거가 무너지기 때문이다.
+    호출부는 store_id와 detected_at(슬롯 시각)만 넘기고, 나머지 수치는 전부 여기서 채운다.
+
+    반환: 이벤트가 없으면 None.
+    """
+    query = text(
+        """
+        SELECT ae.event_id, ae.meter_id, s.store_id, s.name AS store_name,
+               s.biz_category_large, s.biz_category_mid, m.contract_power_kw,
+               ae.detected_at, ae.level, ae.rule_triggered,
+               ae.metric_value, ae.threshold_value
+        FROM anomaly_events ae
+        JOIN stores s ON s.meter_id = ae.meter_id
+        JOIN meters m ON m.meter_id = ae.meter_id
+        WHERE s.store_id = :store_id AND ae.detected_at = :detected_at
+        LIMIT 1
+        """
+    )
+    with engine.connect() as conn:
+        row = conn.execute(
+            query, {"store_id": store_id, "detected_at": detected_at}
+        ).mappings().first()
+    return dict(row) if row else None

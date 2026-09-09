@@ -35,6 +35,7 @@ from ami_db.serving import (  # noqa: E402
     LATEST_SNAPSHOT_DATE,
     get_all_stores,
     get_anomalies,
+    get_anomaly_event,
     get_anomaly_snapshot,
     get_current_status_all,
     get_current_status_one,
@@ -46,7 +47,10 @@ from ami_db.serving import (  # noqa: E402
     get_stores_snapshot,
     parse_snapshot_time,
 )
+from ami_db.narrate import narrate_event  # noqa: E402
 from app.schemas import (  # noqa: E402
+    AnomalyExplainRequest,
+    AnomalyExplainResponse,
     AnomalyListResponse,
     AnomalySnapshotResponse,
     CurrentStatusListResponse,
@@ -359,6 +363,61 @@ def anomalies_snapshot(
         return get_anomaly_snapshot(_engine, date, time)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post(
+    "/api/anomalies/explain", tags=["안전감지"], summary="감지 이벤트 설명문 생성 (LLM)",
+    response_model=AnomalyExplainResponse,
+)
+def explain_anomaly(body: AnomalyExplainRequest):
+    """
+    이미 규칙이 확정한 이벤트를 **사람이 읽을 문장으로 옮기는** 엔드포인트다.
+    점주용 문자 초안 / 관리자용 점검 사유 / (위험이면) 신고 접수용 초안을 돌려준다.
+
+    **LLM은 판정에 관여하지 않는다.** 등급(`level`)과 발동 규칙(`rule_triggered`)은
+    `ami_db.anomaly`의 규칙이 이미 결정한 값을 그대로 싣고, 모델은 그것을 설명만 한다.
+    탐지에 AI를 쓰지 않는 이유는 실측 비교(규칙 F1 0.698 vs Isolation Forest 0.582)와
+    KEC 212.3이라는 법정 근거를 확률 모델로 대체할 수 없다는 판단 때문이다.
+
+    **환각 방지 장치 2가지**:
+    1. 수치는 클라이언트가 보낸 값이 아니라 `anomaly_events`에서 다시 읽는다 - 임의의
+       값을 넣어 그럴듯한 설명을 만들어내는 것을 원천 차단한다.
+    2. 생성된 문장의 모든 숫자를 입력 수치와 자동 대조한다(`verification_passed`).
+       입력에 없던 숫자가 섞이면 `unknown_numbers`에 담겨 함께 반환되므로, 화면에서
+       그대로 신뢰할지 사람이 판단할 수 있다.
+
+    해당 (store_id, detected_at) 이벤트가 없으면 404, 서버에 `NVIDIA_API_KEY`가
+    설정돼 있지 않으면 503(다른 엔드포인트는 정상 동작).
+    """
+    event = get_anomaly_event(_engine, body.store_id, body.detected_at)
+    if event is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"store_id={body.store_id}, detected_at={body.detected_at.isoformat()}에 "
+                   "해당하는 감지 이벤트가 없습니다 (GET /api/anomalies/snapshot의 값을 그대로 넘기세요).",
+        )
+    try:
+        result = narrate_event(event)
+    except RuntimeError as e:  # API 키 미설정
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:  # LLM 호출 실패/응답 파싱 실패
+        raise HTTPException(status_code=502, detail=f"설명문 생성에 실패했습니다: {e}")
+
+    return {
+        "store_id": event["store_id"],
+        "store_name": event["store_name"],
+        "detected_at": event["detected_at"],
+        "level": event["level"],
+        "rule_triggered": event["rule_triggered"],
+        "owner_sms": result.owner_sms,
+        "admin_note": result.admin_note,
+        "emergency_report": result.emergency_report,
+        "verification_passed": result.verification_passed,
+        "unknown_numbers": result.unknown_numbers,
+        "model": result.model,
+        "elapsed_ms": result.elapsed_ms,
+        "source": result.source,
+    }
 
 
 @app.post(

@@ -3,7 +3,7 @@
 > 이 문서는 `scripts/generate_api_docs.py`가 FastAPI OpenAPI 스키마에서 **자동 생성**했습니다.
 > 코드(엔드포인트·모델)를 고쳤다면 재생성하세요: `uv run python scripts/generate_api_docs.py`
 >
-> 버전: `0.1.0` · 생성 시각: `2026-09-08 19:31 UTC`
+> 버전: `0.1.0` · 생성 시각: `2026-09-09 15:24 UTC`
 
 **Base URL(로컬)**: `http://localhost:8000`  (Swagger UI: `http://localhost:8000/docs`)
 
@@ -381,6 +381,47 @@ date/time을 둘 다 생략하면 서버 "현재" 기준(`ami_db.serving.service
 | `repeat_count` | `integer \| null` | '주의반복'일 때만 값이 있음 - 최근 24시간 내 서로 다른 주의 사건(episode) 개수. 슬롯(15분) 원시 행 개수가 아니다(사건 하나도 여러 슬롯에 걸쳐 여러 행으로 남으므로). |
 
 </details>
+
+---
+
+### `POST /api/anomalies/explain`
+**감지 이벤트 설명문 생성 (LLM)**
+
+이미 규칙이 확정한 이벤트를 **사람이 읽을 문장으로 옮기는** 엔드포인트다.
+점주용 문자 초안 / 관리자용 점검 사유 / (위험이면) 신고 접수용 초안을 돌려준다.
+
+**LLM은 판정에 관여하지 않는다.** 등급(`level`)과 발동 규칙(`rule_triggered`)은
+`ami_db.anomaly`의 규칙이 이미 결정한 값을 그대로 싣고, 모델은 그것을 설명만 한다.
+탐지에 AI를 쓰지 않는 이유는 실측 비교(규칙 F1 0.698 vs Isolation Forest 0.582)와
+KEC 212.3이라는 법정 근거를 확률 모델로 대체할 수 없다는 판단 때문이다.
+
+**환각 방지 장치 2가지**:
+1. 수치는 클라이언트가 보낸 값이 아니라 `anomaly_events`에서 다시 읽는다 - 임의의
+   값을 넣어 그럴듯한 설명을 만들어내는 것을 원천 차단한다.
+2. 생성된 문장의 모든 숫자를 입력 수치와 자동 대조한다(`verification_passed`).
+   입력에 없던 숫자가 섞이면 `unknown_numbers`에 담겨 함께 반환되므로, 화면에서
+   그대로 신뢰할지 사람이 판단할 수 있다.
+
+해당 (store_id, detected_at) 이벤트가 없으면 404, 서버에 `NVIDIA_API_KEY`가
+설정돼 있지 않으면 503(다른 엔드포인트는 정상 동작).
+
+**응답 (200)** — `AnomalyExplainResponse`
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `store_id` | `integer` |  |
+| `store_name` | `string \| null` |  |
+| `detected_at` | `string` |  |
+| `level` | `string` | '주의' | '위험' - 규칙이 이미 확정한 등급(LLM이 바꾸지 않음) |
+| `rule_triggered` | `string` |  |
+| `owner_sms` | `string` | 점주에게 보낼 문자 초안(2~3문장, 존댓말) |
+| `admin_note` | `string` | 관리자용 점검 사유(1~2문장, 발동 규칙과 근거 수치 명시) |
+| `emergency_report` | `string \| null` | 신고 접수용 초안. level='위험'일 때만 채워지고 '주의'면 null. |
+| `verification_passed` | `boolean` | 생성문에 입력에 없던 숫자가 섞였는지 자동 대조한 결과. false면 환각 의심 - unknown_numbers에 그 숫자가 담긴다. 판정 로직이 아니라 LLM 출력 검사다. |
+| `unknown_numbers` | `string[]` | 입력 수치와 대조되지 않은 숫자 목록. 비어 있으면 통과. |
+| `model` | `string` | 생성에 사용한 모델 |
+| `elapsed_ms` | `integer` | LLM 호출 소요 시간(ms) |
+| `source` | `string` | 'live'=이번 호출로 생성 | 'cache'=외부 LLM API 장애로 이전 생성분을 재사용. 호스팅 모델이 예고 없이 응답 불능이 되는 것을 실측했기 때문에 둔 방어 장치이며, 캐시본을 쓴 사실을 숨기지 않는다. |
 
 ---
 

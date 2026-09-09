@@ -1,0 +1,20 @@
+{
+  "12:2026-07-02 02:15": {
+    "owner_sms": "충북식당 점주님, 2026년 7월 2일 02:15에 15분간 18.95kWh의 전력 사용이 감지되었습니다. 계약전력 45kW의 130%인 14.62kWh를 초과하여 안전등급이 '위험'으로 판정되었습니다. 점검을 부탁드립니다.",
+    "admin_note": "KEC 212.3 표 212.3-2 산업용 배선차단기 기준에 따라 계약전력 130%가 60분 지속된 것으로 판단됩니다. 관측값 18.95kWh, 임계값 14.62kWh.",
+    "emergency_report": "충북식당에서 2026년 7월 2일 02:15에 비영업시간 중 전력 사용이 계약전력 130%를 초과하여 안전등급 '위험'으로 판정되었습니다. 관측값은 15분간 18.95kWh로, 임계값 14.62kWh를 상회했습니다. KEC 212.3 표 212.3-2 산업용 배선차단기 기준에 따라 긴급 점검이 필요합니다.",
+    "model": "mistralai/mistral-nemotron",
+    "elapsed_ms": 7542,
+    "verification_passed": true,
+    "unknown_numbers": []
+  },
+  "15:2026-07-22 05:45": {
+    "owner_sms": "소문난순대 매장님, 비영업시간인 2026-07-22 05:45에 전력 사용량이 0.81kWh로 평소(0.65kWh)보다 높게 측정되었습니다. 안전 점검을 부탁드립니다.",
+    "admin_note": "비영업시간 baseline 대비 초과 규칙 발동. 15분간 0.81kWh 사용(임계 0.65kWh).",
+    "emergency_report": null,
+    "model": "mistralai/mistral-nemotron",
+    "elapsed_ms": 4344,
+    "verification_passed": true,
+    "unknown_numbers": []
+  }
+}
