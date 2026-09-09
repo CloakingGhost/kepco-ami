@@ -120,12 +120,68 @@ def _fake_result(**overrides) -> NarrationResult:
     return NarrationResult(**base)
 
 
+class TestPreferCache:
+    """prefer_cache=true면 LLM을 아예 호출하지 않고 캐시본을 즉시 돌려준다(시연용 옵션)."""
+
+    def test_cache_hit_skips_llm_entirely(self, monkeypatch, tmp_path):
+        import ami_db.narrate as narrate
+
+        called = {"n": 0}
+
+        def _should_not_be_called(*args, **kwargs):
+            called["n"] += 1
+            raise AssertionError("prefer_cache=True인데 LLM을 호출했다")
+
+        cache_file = tmp_path / "narration_cache.json"
+        cache_file.write_text(
+            '{"12:2026-07-02 02:15": {"owner_sms":"캐시된 문자","admin_note":"캐시된 사유",'
+            '"emergency_report":null,"model":"cached-model","elapsed_ms":1234,'
+            '"verification_passed":true,"unknown_numbers":[]}}',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(narrate, "CACHE_PATH", cache_file)
+        monkeypatch.setattr(narrate, "_call_llm", _should_not_be_called)
+
+        result = narrate.narrate_event(DANGER_EVENT, prefer_cache=True)
+        assert result.source == "cache"
+        assert result.owner_sms == "캐시된 문자"
+        assert called["n"] == 0
+
+    def test_cache_miss_falls_through_to_llm(self, monkeypatch, tmp_path):
+        """캐시에 없으면 prefer_cache여도 평소대로 LLM을 시도해야 한다."""
+        import ami_db.narrate as narrate
+
+        monkeypatch.setattr(narrate, "CACHE_PATH", tmp_path / "empty.json")
+        monkeypatch.setattr(
+            narrate, "_call_llm",
+            lambda event, model, timeout: ('{"owner_sms":"새로 생성","admin_note":"새 사유"}', 50),
+        )
+        result = narrate.narrate_event(DANGER_EVENT, prefer_cache=True)
+        assert result.source == "live"
+        assert result.owner_sms == "새로 생성"
+
+
 class TestExplainEndpoint:
+    def test_prefer_cache_is_passed_through(self, client, monkeypatch):
+        """body의 prefer_cache가 narrate_event까지 전달돼야 한다."""
+        seen = {}
+
+        def _capture(event, **kw):
+            seen.update(kw)
+            return _fake_result(source="cache")
+
+        monkeypatch.setattr("app.serving_api.narrate_event", _capture)
+        client.post(
+            "/api/anomalies/explain",
+            json={"store_id": DANGER_STORE_ID, "detected_at": DANGER_TS, "prefer_cache": True},
+        )
+        assert seen.get("prefer_cache") is True
+
     def test_normal_returns_three_drafts(self, client, monkeypatch):
         """정상: 규칙이 확정한 등급/규칙을 그대로 싣고 문장 3종을 돌려준다."""
         monkeypatch.setattr(
             "app.serving_api.narrate_event",
-            lambda event: _fake_result(emergency_report="긴급 점검이 필요합니다."),
+            lambda event, **kw: _fake_result(emergency_report="긴급 점검이 필요합니다."),
         )
         resp = client.post(
             "/api/anomalies/explain",
@@ -143,7 +199,7 @@ class TestExplainEndpoint:
 
     def test_caution_event_has_no_emergency_report(self, client, monkeypatch):
         """주의 등급이면 신고 초안은 null이어야 한다."""
-        monkeypatch.setattr("app.serving_api.narrate_event", lambda event: _fake_result())
+        monkeypatch.setattr("app.serving_api.narrate_event", lambda event, **kw: _fake_result())
         resp = client.post(
             "/api/anomalies/explain",
             json={"store_id": CAUTION_STORE_ID, "detected_at": CAUTION_TS},
@@ -157,7 +213,7 @@ class TestExplainEndpoint:
         """검증 실패를 감추지 않고 그대로 노출해야 사람이 판단할 수 있다."""
         monkeypatch.setattr(
             "app.serving_api.narrate_event",
-            lambda event: _fake_result(verification_passed=False, unknown_numbers=["78"]),
+            lambda event, **kw: _fake_result(verification_passed=False, unknown_numbers=["78"]),
         )
         resp = client.post(
             "/api/anomalies/explain",
@@ -170,7 +226,7 @@ class TestExplainEndpoint:
     def test_cache_fallback_is_labeled(self, client, monkeypatch):
         """라이브 호출이 죽어 캐시본을 쓸 때는 source='cache'로 드러나야 한다."""
         monkeypatch.setattr(
-            "app.serving_api.narrate_event", lambda event: _fake_result(source="cache")
+            "app.serving_api.narrate_event", lambda event, **kw: _fake_result(source="cache")
         )
         resp = client.post(
             "/api/anomalies/explain",
@@ -188,7 +244,7 @@ class TestExplainEndpoint:
 
     def test_missing_api_key_returns_503(self, client, monkeypatch):
         """키가 없으면 이 엔드포인트만 503이고 다른 API는 살아 있어야 한다."""
-        def _raise(event):
+        def _raise(event, **kw):
             raise RuntimeError("NVIDIA_API_KEY가 설정되지 않았습니다 (db/.env 확인).")
 
         monkeypatch.setattr("app.serving_api.narrate_event", _raise)
@@ -201,7 +257,7 @@ class TestExplainEndpoint:
 
     def test_llm_failure_returns_502(self, client, monkeypatch):
         """LLM 호출/파싱 실패는 502로 구분해서 알린다(키 문제인 503과 다른 원인)."""
-        def _raise(event):
+        def _raise(event, **kw):
             raise ValueError("JSON을 찾을 수 없습니다")
 
         monkeypatch.setattr("app.serving_api.narrate_event", _raise)
@@ -220,7 +276,7 @@ class TestExplainEndpoint:
         """
         captured = {}
 
-        def _capture(event):
+        def _capture(event, **kw):
             captured.update(event)
             return _fake_result()
 

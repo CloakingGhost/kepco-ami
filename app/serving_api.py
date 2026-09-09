@@ -397,7 +397,7 @@ def explain_anomaly(body: AnomalyExplainRequest):
                    "해당하는 감지 이벤트가 없습니다 (GET /api/anomalies/snapshot의 값을 그대로 넘기세요).",
         )
     try:
-        result = narrate_event(event)
+        result = narrate_event(event, prefer_cache=body.prefer_cache)
     except RuntimeError as e:  # API 키 미설정
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:  # LLM 호출 실패/응답 파싱 실패

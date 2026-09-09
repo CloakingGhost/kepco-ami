@@ -330,6 +330,12 @@ class AnomalyExplainRequest(BaseModel):
         description="설명할 이벤트의 감지 시각(15분 슬롯). GET /api/anomalies/snapshot 응답의 "
                     "detected_at을 그대로 넘기면 된다. 해당 이벤트가 없으면 404.",
     )
+    prefer_cache: bool = Field(
+        default=False,
+        description="true면 이전에 생성해 둔 설명이 있을 때 LLM을 호출하지 않고 즉시 반환한다"
+                    "(응답 1초 미만, source='cache'). 외부 모델이 느린 날 시연용 - 기본값 false는 "
+                    "항상 새로 생성을 시도하고, 실패했을 때만 캐시로 넘어간다.",
+    )
 
 
 class AnomalyExplainResponse(BaseModel):

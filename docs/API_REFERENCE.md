@@ -3,7 +3,7 @@
 > 이 문서는 `scripts/generate_api_docs.py`가 FastAPI OpenAPI 스키마에서 **자동 생성**했습니다.
 > 코드(엔드포인트·모델)를 고쳤다면 재생성하세요: `uv run python scripts/generate_api_docs.py`
 >
-> 버전: `0.1.0` · 생성 시각: `2026-09-09 15:24 UTC`
+> 버전: `0.1.0` · 생성 시각: `2026-09-09 15:57 UTC`
 
 **Base URL(로컬)**: `http://localhost:8000`  (Swagger UI: `http://localhost:8000/docs`)
 

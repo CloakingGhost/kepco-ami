@@ -324,7 +324,9 @@ def _narrate_with_model(event: dict, model: str, timeout: int) -> NarrationResul
     )
 
 
-def narrate_event(event: dict, model: str | None = None) -> NarrationResult:
+def narrate_event(
+    event: dict, model: str | None = None, prefer_cache: bool = False
+) -> NarrationResult:
     """
     이벤트 dict -> 점주 문자/관리자 사유/(위험이면) 신고 초안 + 숫자 검증 결과.
 
@@ -335,6 +337,14 @@ def narrate_event(event: dict, model: str | None = None) -> NarrationResult:
     (실측: mistral-nemotron이 2.8초에서 60초 타임아웃으로 급변) 라이브 호출 실패가 곧
     화면 실패가 되지 않게 한다. 캐시본을 쓸 때는 source="cache"로 그 사실을 드러낸다.
     """
+    # prefer_cache: 이미 만들어 둔 설명이 있으면 라이브 호출 없이 즉시 돌려준다.
+    # 외부 모델이 느린 날 시연할 때 쓰는 옵션이다 - 라이브를 먼저 시도하면 두 모델이
+    # 타임아웃될 때까지 24초를 기다린 뒤에야 같은 캐시본을 받게 되기 때문이다.
+    if prefer_cache:
+        cached = _load_cache().get(_cache_key(event))
+        if cached:
+            return NarrationResult(**cached, raw_output="", source="cache")
+
     if not settings.nvidia_api_key:
         raise RuntimeError("NVIDIA_API_KEY가 설정되지 않았습니다 (db/.env 확인).")
 
