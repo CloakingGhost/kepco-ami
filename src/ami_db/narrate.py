@@ -30,10 +30,14 @@ from datetime import datetime
 from .config import CACHE_DIR, settings
 
 API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-# 1순위는 짧게 끊고 대체 모델로 넘어가는 게 낫고(살아 있으면 3초면 끝난다), 대체 모델은
-# 마지막 라이브 시도라 콜드스타트(실측 35초)를 견딜 만큼 넉넉히 준다.
-PRIMARY_TIMEOUT_SEC = 20
-FALLBACK_TIMEOUT_SEC = 50
+# 타임아웃 상한은 **앞단 프록시가 정한다**. 실측(2026-09-10): 서버 nginx가 60초,
+# Next.js dev 프록시가 30초에서 연결을 끊는다. 그래서 1순위(10초) + 대체(14초) +
+# 오버헤드가 30초 안에 들어오도록 잡았다 - 이걸 넘기면 사용자는 응답 대신 502/504를 본다.
+#
+# 성공 사례는 3.8~11초 구간에 몰려 있어(docs/LLM_설명API_검증결과.md) 10초로 끊어도
+# 대부분 잡힌다. 둘 다 실패하면 캐시로 즉시 응답하므로 최악의 경우에도 24초 안에 끝난다.
+PRIMARY_TIMEOUT_SEC = 10
+FALLBACK_TIMEOUT_SEC = 14
 CACHE_PATH = CACHE_DIR / "narration_cache.json"
 
 SYSTEM_PROMPT = """당신은 전기안전 관제 시스템의 보고서 작성 보조입니다.
