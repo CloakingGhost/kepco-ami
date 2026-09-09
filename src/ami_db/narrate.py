@@ -219,11 +219,28 @@ def build_allowed_numbers(event: dict) -> set[float]:
 
     # 관측/임계에서 자연스럽게 파생되는 표현(초과분, 배수)도 허용한다 - 모델이
     # "임계보다 4.32kWh 높다"처럼 쓰는 것은 지어낸 값이 아니라 계산된 값이다.
-    metric, threshold = event.get("metric_value"), event.get("threshold_value")
-    if metric is not None and threshold is not None and threshold:
-        allowed.add(round(float(metric) - float(threshold), 2))
-        allowed.add(round(float(metric) / float(threshold), 2))
-        allowed.add(round(float(metric) / float(threshold) * 100, 1))
+    metric, threshold = _as_float(event.get("metric_value")), _as_float(event.get("threshold_value"))
+    if metric is not None and threshold:
+        allowed.add(round(metric - threshold, 2))
+        allowed.add(round(metric / threshold, 2))
+        allowed.add(round(metric / threshold * 100, 1))
+
+    # 15분 kWh <-> 순간 kW 환산(x4)도 허용한다. KEC는 kW로 말하는데 우리 임계값은
+    # 15분 kWh로 저장돼 있어서, 모델이 "임계 14.62kWh = 58.5kW"처럼 환산해 쓰는 일이
+    # 실제로 발생했다(프로덕션 실측). 이건 지어낸 값이 아니라 단위 변환이므로 허용하고,
+    # 대신 출처를 추적할 수 없는 값(온도·피해액 등)은 계속 걸러낸다.
+    for base in (metric, threshold):
+        if base:
+            allowed.add(round(base * 4, 2))
+            allowed.add(round(base * 4, 1))
+
+    # 계약전력 x 규칙 비율(예: 45kW의 130% = 58.5kW)도 같은 이유로 허용.
+    contract = _as_float(event.get("contract_power_kw"))
+    if contract:
+        for token in _number_tokens(rule_text):
+            ratio = _norm(token)
+            if ratio and 1 < ratio <= 300:  # 130, 80 같은 퍼센트 표기만 대상
+                allowed.add(round(contract * ratio / 100, 2))
     return allowed
 
 
