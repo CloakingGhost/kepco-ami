@@ -18,10 +18,6 @@ from sqlalchemy import Engine, text
 
 EARLIEST_SAMPLE_DATE = date(2026, 4, 1)
 
-# 스냅샷 API(get_stores_snapshot) 전용 상한. 이 엔드포인트는 "AMI 실측 샘플데이터"
-# 자체의 날짜 범위만 받기로 했으므로 합성 구간(07-01~)을 포함하지 않는다.
-LATEST_SNAPSHOT_DATE = date(2026, 6, 30)
-
 # 전체 서비스 조회 상한. date.today()를 쓰지 않는 이유:
 #   - 실측 데이터는 2026-06-30까지만 존재한다.
 #   - 7월은 안전감지(위기 감지) 데모를 위해 의도적으로 열어둔 합성 구간이다 - 실측
@@ -33,6 +29,18 @@ LATEST_SNAPSHOT_DATE = date(2026, 6, 30)
 #     (06_generate_synthetic_timeseries.SYNTHETIC_END_DATE)과 같은 날짜로 못박아
 #     "조회 가능 = 데이터 존재"를 항상 참으로 유지한다.
 LATEST_SERVICE_DATE = date(2026, 7, 31)
+
+# 스냅샷 API(get_stores_snapshot) 전용 상한.
+#
+# 원래는 2026-06-30(실측 구간)이었다 - "이 엔드포인트는 AMI 실측 샘플데이터 범위만
+# 받는다"는 정책이었지 데이터가 없어서가 아니었다(store_operating_status는 09단계가
+# 실측+합성 전체 그리드를 채우므로 7월도 21개 매장 전부 있다).
+#
+# 2026-09-10에 LATEST_SERVICE_DATE와 같은 값으로 넓혔다. 안전감지 데모(위험 시나리오)가
+# 7월 합성 구간에만 있는데 화면 헤더가 6월까지만 갈 수 있어서, 지도와 안전감지 패널이
+# 서로 다른 날짜를 봐야 하는 구조가 됐기 때문이다. 대신 7월을 고르면 화면에서
+# "합성 데이터" 안내를 띄워 실측과 혼동하지 않게 한다.
+LATEST_SNAPSHOT_DATE = LATEST_SERVICE_DATE
 
 _SNAPSHOT_DATE_RE = re.compile(r"^\d{2}-\d{2}-\d{2}$")
 _SNAPSHOT_TIME_RE = re.compile(r"^([01]\d|2[0-3]):(00|15|30|45)$")

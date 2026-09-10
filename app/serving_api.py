@@ -48,7 +48,7 @@ from ami_db.serving import (  # noqa: E402
     get_stores_snapshot,
     parse_snapshot_time,
 )
-from ami_db.narrate import narrate_event  # noqa: E402
+from ami_db.narrate import NarrationUnavailable, narrate_event  # noqa: E402
 from app.schemas import (  # noqa: E402
     AnomalyExplainRequest,
     AnomalyExplainResponse,
@@ -162,7 +162,7 @@ def stores_snapshot(
         default="26-05-09",
         description=f"조회할 날짜, 'YY-MM-DD' 형식(연도 2자리). 범위: "
                     f"{EARLIEST_SAMPLE_DATE.strftime('%y-%m-%d')} ~ {LATEST_SNAPSHOT_DATE.strftime('%y-%m-%d')} "
-                    f"(AMI 샘플데이터 실측 구간).",
+                    f"(2026-06-30까지 실측, 7월은 안전감지 데모용 합성 구간).",
     ),
     time: str = Query(
         default="19:15",
@@ -173,8 +173,10 @@ def stores_snapshot(
     예시: `/api/stores/snapshot?date=26-05-09&time=19:15` -> 그 시점 21개 매장의
     위치/영업상태/혼잡도/전력사용량을 한 번에 반환한다.
 
-    조회 가능 날짜 범위는 AMI 샘플데이터의 시작일~마지막일인 2026-04-01~2026-06-30로
-    고정된다(다른 엔드포인트처럼 오늘까지의 합성 구간을 포함하지 않음).
+    조회 가능 날짜 범위는 2026-04-01~2026-07-31이다. 06-30까지가 실측이고 7월은
+    안전감지 데모용 합성 구간이라, 7월을 조회하면 화면에서 합성 데이터임을 안내해야 한다
+    (원래는 실측 구간만 받았는데, 안전감지 데모가 7월에만 있어 지도와 안전감지 패널이
+    서로 다른 날짜를 봐야 하는 문제가 있어 넓혔다).
 
     계기 해상도 처리: data_resolution='1hour'인 매장(5개)은 15/30/45분 슬롯이 애초에
     없으므로 입력 시각의 "시"만 사용해 정각 데이터를 가져온다(예: 19:15 입력 -> 19:00 슬롯).
@@ -446,9 +448,11 @@ def explain_anomaly(body: AnomalyExplainRequest):
         )
     try:
         result = narrate_event(event, prefer_cache=body.prefer_cache)
+    except NarrationUnavailable as e:  # 외부 모델 전부 실패 + 캐시 없음
+        raise HTTPException(status_code=502, detail=str(e))
     except RuntimeError as e:  # API 키 미설정
         raise HTTPException(status_code=503, detail=str(e))
-    except Exception as e:  # LLM 호출 실패/응답 파싱 실패
+    except Exception as e:  # LLM 응답 파싱 실패 등
         raise HTTPException(status_code=502, detail=f"설명문 생성에 실패했습니다: {e}")
 
     return {

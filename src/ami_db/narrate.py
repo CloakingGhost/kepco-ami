@@ -165,6 +165,15 @@ def build_prompt_payload(event: dict) -> dict:
     return {k: v for k, v in payload.items() if v is not None}
 
 
+class NarrationUnavailable(RuntimeError):
+    """
+    외부 모델이 모두 실패하고 캐시도 없어 설명문을 만들 수 없는 상태.
+
+    "API 키가 없다"(RuntimeError)와 구분하려고 따로 둔다 - 호출부가 전자는 503,
+    후자는 502로 내보내야 로그만 보고 원인을 오해하지 않는다.
+    """
+
+
 @dataclass
 class NarrationResult:
     owner_sms: str
@@ -449,4 +458,7 @@ def narrate_event(
     if cached:
         return NarrationResult(**cached, raw_output="", source="cache")
 
-    raise RuntimeError(f"설명문 생성 실패(캐시도 없음) - 시도: {', '.join(errors)}")
+    # RuntimeError를 쓰지 않는다 - 호출부(serving_api)가 RuntimeError를 "API 키 미설정"으로
+    # 보고 503을 내는데, 여기는 키 문제가 아니라 외부 모델 장애다. 실제로 로그에 503이
+    # 찍혀 키가 빠진 것처럼 오해를 샀다(2026-09-10). 502로 구분되도록 다른 예외를 쓴다.
+    raise NarrationUnavailable(f"설명문 생성 실패(캐시도 없음) - 시도: {', '.join(errors)}")
