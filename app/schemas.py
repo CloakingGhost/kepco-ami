@@ -10,6 +10,7 @@ serving_api.py가 너무 길어짐). places-api-project/src/places_api/models.py
 from __future__ import annotations
 
 from datetime import date as date_type, datetime, time
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -365,30 +366,37 @@ class AnomalyExplainRequest(BaseModel):
     store_id: int = Field(examples=[12], description="상가 ID (1~21). body로 받는 이유는 URL에 store_id를 노출하지 않기 위함")
     detected_at: datetime = Field(
         examples=["2026-07-02T02:15:00"],
-        description="설명할 이벤트의 감지 시각(15분 슬롯). GET /api/anomalies/snapshot 응답의 "
-                    "detected_at을 그대로 넘기면 된다. 해당 이벤트가 없으면 404.",
-    )
-    prefer_cache: bool = Field(
-        default=False,
-        description="true면 이전에 생성해 둔 설명이 있을 때 LLM을 호출하지 않고 즉시 반환한다"
-                    "(응답 1초 미만, source='cache'). 외부 모델이 느린 날 시연용 - 기본값 false는 "
-                    "항상 새로 생성을 시도하고, 실패했을 때만 캐시로 넘어간다.",
+        description="분석할 이벤트의 감지 시각(15분 슬롯). GET /api/anomalies/snapshot의 detected_at이나 "
+                    "GET /api/anomalies/period의 사건 start_at을 그대로 넘기면 된다. 해당 이벤트가 없으면 404.",
     )
 
 
 class AnomalyExplainResponse(BaseModel):
+    status: Literal["none", "pending", "done", "failed"] = Field(
+        examples=["done"],
+        description="none=요청된 적 없음 | pending=AI가 생성 중(백그라운드) | done=완료(DB 저장본) | "
+                    "failed=외부 AI 실패 또는 사용 불가(다시 요청 가능). "
+                    "**AI 실패는 HTTP 에러가 아니라 이 값으로 온다.**",
+    )
+    message: str | None = Field(
+        default=None,
+        examples=[None],
+        description="화면에 그대로 띄울 안내문(none/pending/failed일 때). done이면 null.",
+    )
     store_id: int = Field(examples=[12])
     store_name: str | None = Field(default=None, examples=["충북식당"])
     detected_at: datetime
     level: str = Field(examples=["위험"], description="'주의' | '위험' - 규칙이 이미 확정한 등급(LLM이 바꾸지 않음)")
     rule_triggered: str = Field(examples=["kec212_overload_130pct_60min"])
-    owner_sms: str = Field(
-        examples=["충북식당 점주님, 현재 전력 사용량이 계약 전력의 130%를 초과하고 있습니다. ..."],
-        description="점주에게 보낼 문자 초안(2~3문장, 존댓말)",
+    owner_sms: str | None = Field(
+        default=None,
+        examples=["어젯밤 문을 닫으신 시간에, 매장 전기설비가 감당하도록 되어 있는 양보다 훨씬 많은 전기가 ..."],
+        description="점주에게 보낼 문자 초안(2~3문장, 존댓말, 일상어). status='done'일 때만 채워진다.",
     )
-    admin_note: str = Field(
+    admin_note: str | None = Field(
+        default=None,
         examples=["KEC 212.3 산업용 배선차단기 기준에 따라 계약전력 130%가 60분 지속된 것으로 확인됨."],
-        description="관리자용 점검 사유(1~2문장, 발동 규칙과 근거 수치 명시)",
+        description="관리자용 점검 사유(1~2문장, 발동 규칙과 근거 수치 명시). status='done'일 때만 채워진다.",
     )
     emergency_report: str | None = Field(
         default=None,
@@ -409,24 +417,23 @@ class AnomalyExplainResponse(BaseModel):
         description="점주가 한전(고객센터 123 / cyber.kepco.co.kr)이나 전기공사 업체에 "
                     "그대로 보낼 수 있는 문의 초안.",
     )
-    verification_passed: bool = Field(
+    verification_passed: bool | None = Field(
+        default=None,
         examples=[True],
-        description="생성문에 입력에 없던 숫자가 섞였는지 자동 대조한 결과. false면 환각 의심 - "
-                    "unknown_numbers에 그 숫자가 담긴다. 판정 로직이 아니라 LLM 출력 검사다.",
+        description="생성문에 입력에 없던 숫자가 섞였는지 자동 대조한 결과(판정 로직이 아니라 LLM 출력 검사). "
+                    "서버는 검증을 통과한 결과만 저장하므로 status='done'이면 항상 true.",
     )
     unknown_numbers: list[str] = Field(
         default_factory=list,
         examples=[[]],
         description="입력 수치와 대조되지 않은 숫자 목록. 비어 있으면 통과.",
     )
-    model: str = Field(examples=["mistralai/mistral-nemotron"], description="생성에 사용한 모델")
-    elapsed_ms: int = Field(examples=[2800], description="LLM 호출 소요 시간(ms)")
-    source: str = Field(
-        examples=["live"],
-        description="'live'=이번 호출로 생성 | 'cache'=외부 LLM API 장애로 이전 생성분을 재사용. "
-                    "호스팅 모델이 예고 없이 응답 불능이 되는 것을 실측했기 때문에 둔 방어 장치이며, "
-                    "캐시본을 쓴 사실을 숨기지 않는다.",
+    model: str | None = Field(
+        default=None, examples=["nvidia/nemotron-3-super-120b-a12b"], description="생성에 사용한 모델",
     )
+    elapsed_ms: int | None = Field(default=None, examples=[28800], description="AI 생성 소요 시간(ms)")
+    requested_at: datetime | None = Field(default=None, description="분석을 요청한 시각")
+    completed_at: datetime | None = Field(default=None, description="분석이 끝난 시각(done일 때)")
 
 
 class TimeseriesRow(BaseModel):

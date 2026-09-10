@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
@@ -898,3 +899,125 @@ def get_anomaly_event(engine: Engine, store_id: int, detected_at: datetime) -> d
             query, {"store_id": store_id, "detected_at": detected_at}
         ).mappings().first()
     return dict(row) if row else None
+
+
+# ============================================================
+# AI 분석 저장소 (anomaly_narrations)
+#
+# 분석은 사용자가 요청했을 때만 만들고, 만든 결과는 여기 저장해 다음부터 그대로 읽는다.
+# 요청하지 않은 이벤트의 분석을 미리 만들어 두지 않는다(외부 LLM 호출 낭비). 테이블 설계
+# 근거는 sql/schema.sql의 anomaly_narrations 주석 참고.
+# ============================================================
+
+# 생성 중(pending)인 채로 이만큼 지나면 작업이 사라진 것으로 본다(생성 도중 서버 재기동 등).
+# narrate.JOB_BUDGET_SEC(모델 2개 합계 최대 180초)보다 넉넉히 길어야 멀쩡히 진행 중인
+# 작업을 죽은 것으로 오판해 중복 실행하지 않는다.
+NARRATION_STALE_MINUTES = 5
+
+_NARRATION_COLUMNS = """
+    event_id, status, owner_sms, admin_note, emergency_report, next_steps,
+    inquiry_draft, model, elapsed_ms, verification_passed, unknown_numbers,
+    error_message, requested_at, completed_at
+"""
+
+
+def get_narration(engine: Engine, event_id: int) -> dict | None:
+    """
+    이벤트의 AI 분석 행. 요청된 적이 없으면 None.
+
+    stale: 오래된 pending인지(작업이 사라졌을 가능성). 시각 비교를 DB의 now()로 해서
+    claim_narration과 같은 시계를 쓴다 - 앱 서버와 DB 서버 시계가 달라도 판정이 어긋나지 않는다.
+    """
+    query = text(
+        f"""
+        SELECT {_NARRATION_COLUMNS},
+               (status = 'pending'
+                AND requested_at < now() - make_interval(mins => :stale)) AS stale
+        FROM anomaly_narrations
+        WHERE event_id = :event_id
+        """
+    )
+    with engine.connect() as conn:
+        row = conn.execute(
+            query, {"event_id": event_id, "stale": NARRATION_STALE_MINUTES}
+        ).mappings().first()
+    return dict(row) if row else None
+
+
+def claim_narration(engine: Engine, event_id: int) -> bool:
+    """
+    이 요청이 분석 작업을 맡는다(pending으로 표시). 맡았으면 True.
+
+    같은 이벤트를 두 사람이 동시에 요청해도 작업이 하나만 돌도록 한 문장으로 원자 처리한다.
+    행이 이미 있으면 **failed이거나 오래된 pending일 때만** 덮어쓰고, 진행 중이거나 완료된
+    행은 건드리지 않는다 - 그 경우 RETURNING이 비어 호출부가 작업을 새로 걸지 않는다.
+    """
+    query = text(
+        """
+        INSERT INTO anomaly_narrations (event_id, status, requested_at)
+        VALUES (:event_id, 'pending', now())
+        ON CONFLICT (event_id) DO UPDATE
+           SET status = 'pending', requested_at = now(),
+               completed_at = NULL, error_message = NULL
+         WHERE anomaly_narrations.status = 'failed'
+            OR (anomaly_narrations.status = 'pending'
+                AND anomaly_narrations.requested_at < now() - make_interval(mins => :stale))
+        RETURNING event_id
+        """
+    )
+    with engine.begin() as conn:
+        claimed = conn.execute(
+            query, {"event_id": event_id, "stale": NARRATION_STALE_MINUTES}
+        ).first()
+    return claimed is not None
+
+
+def save_narration_done(engine: Engine, event_id: int, result) -> None:
+    """생성 성공 결과(narrate.NarrationResult)를 저장한다. 이후 요청은 이 행을 그대로 읽는다."""
+    query = text(
+        """
+        UPDATE anomaly_narrations
+           SET status = 'done',
+               owner_sms = :owner_sms,
+               admin_note = :admin_note,
+               emergency_report = :emergency_report,
+               next_steps = CAST(:next_steps AS jsonb),
+               inquiry_draft = :inquiry_draft,
+               model = :model,
+               elapsed_ms = :elapsed_ms,
+               verification_passed = :verification_passed,
+               unknown_numbers = CAST(:unknown_numbers AS jsonb),
+               error_message = NULL,
+               completed_at = now()
+         WHERE event_id = :event_id
+        """
+    )
+    with engine.begin() as conn:
+        conn.execute(query, {
+            "event_id": event_id,
+            "owner_sms": result.owner_sms,
+            "admin_note": result.admin_note,
+            "emergency_report": result.emergency_report,
+            "next_steps": json.dumps(result.next_steps, ensure_ascii=False),
+            "inquiry_draft": result.inquiry_draft,
+            "model": result.model,
+            "elapsed_ms": result.elapsed_ms,
+            "verification_passed": result.verification_passed,
+            "unknown_numbers": json.dumps(result.unknown_numbers, ensure_ascii=False),
+        })
+
+
+def save_narration_failed(engine: Engine, event_id: int, error_message: str) -> None:
+    """
+    생성 실패를 기록한다. 원인(error_message)은 운영 확인용이고 화면에는 보내지 않는다.
+    failed 행은 다시 요청하면 claim_narration이 새로 맡는다(외부 모델 장애는 일시적이다).
+    """
+    query = text(
+        """
+        UPDATE anomaly_narrations
+           SET status = 'failed', error_message = :error_message, completed_at = now()
+         WHERE event_id = :event_id AND status = 'pending'
+        """
+    )
+    with engine.begin() as conn:
+        conn.execute(query, {"event_id": event_id, "error_message": error_message})

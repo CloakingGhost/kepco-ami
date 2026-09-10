@@ -188,6 +188,38 @@ CREATE TABLE IF NOT EXISTS anomaly_events (
 );
 CREATE INDEX IF NOT EXISTS idx_anomaly_events_meter_detected ON anomaly_events (meter_id, detected_at);
 
+-- 8) 안전감지 AI 분석 결과 (anomaly_events의 자식이라 FK 생성 순서상 여기 둔다)
+--
+-- **사용자가 분석을 요청했을 때만 행이 생긴다.** 감지된 이벤트마다 미리 만들어 두지
+-- 않는다 - 요청하지 않은 분석에 외부 LLM을 쓰는 건 낭비이고, 여기 쌓인 행은 "누군가
+-- 실제로 요청했고 AI가 실제로 만든 결과"여야 의미가 있다. 한 번 만들어진 분석은 여기서
+-- 그대로 다시 읽는다(재생성 요청은 범위 밖).
+--
+-- status는 요청 처리 상태다. LLM 호출이 24~57초(2026-09-10 실측)라 앞단 프록시 한도
+-- (30초) 안에 요청을 붙잡고 기다릴 수 없어서, 요청은 즉시 'pending'으로 응답하고 생성은
+-- 백그라운드에서 한다. 화면은 이 status를 다시 조회해 완료를 확인한다.
+--   pending = 생성 중   done = 완료(검증 통과한 결과만)   failed = 외부 모델 실패
+-- 'failed'는 다시 요청할 수 있다(모델 장애는 일시적이다). 오래된 'pending'(서버 재기동으로
+-- 작업이 사라진 경우)도 다시 요청할 수 있다 - 기준은 ami_db.serving.NARRATION_STALE_MINUTES.
+CREATE TABLE IF NOT EXISTS anomaly_narrations (
+    event_id              BIGINT PRIMARY KEY REFERENCES anomaly_events(event_id) ON DELETE CASCADE,
+        -- 이벤트가 재계산으로 지워지면 그 분석도 같이 지운다 - 분석 대상 수치가 사라졌는데
+        -- 문장만 남으면 근거 없는 설명이 된다.
+    status                  TEXT NOT NULL CHECK (status IN ('pending', 'done', 'failed')),
+    owner_sms                 TEXT,
+    admin_note                 TEXT,
+    emergency_report            TEXT,          -- '위험'일 때만 채워지고 '주의'면 NULL
+    next_steps                   JSONB NOT NULL DEFAULT '[]'::jsonb,
+    inquiry_draft                 TEXT,
+    model                          TEXT,
+    elapsed_ms                      INTEGER,
+    verification_passed              BOOLEAN,
+    unknown_numbers                   JSONB NOT NULL DEFAULT '[]'::jsonb,
+    error_message                      TEXT,   -- failed일 때 원인(운영 로그용, 화면에는 안 보냄)
+    requested_at                        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at                         TIMESTAMPTZ
+);
+
 -- 7) Google Places 원본 응답 캐시 (재호출 없이 재사용 가능하게 원문 보관)
 CREATE TABLE IF NOT EXISTS google_places_cache (
     store_id                   INTEGER NOT NULL REFERENCES stores(store_id) ON DELETE CASCADE,

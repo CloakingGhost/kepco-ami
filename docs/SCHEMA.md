@@ -18,6 +18,7 @@
   4. [store_operating_hours](#4-store_operating_hours--운영시간)
   5. [store_operating_status](#5-store_operating_status--운영상태-판정-결과)
   6. [anomaly_events](#6-anomaly_events--안전감지-이상치)
+     - [6-1. anomaly_narrations](#6-1-anomaly_narrations--안전감지-ai-분석-결과) — 요청 시 생성한 AI 분석 저장
   7. [google_places_cache](#7-google_places_cache--google-places-원본-캐시)
 
 ---
@@ -45,6 +46,7 @@
 | `store_operating_hours` | 요일별 운영시간 (추정치+실측 공존) | `(store_id, source, day_of_week)` | `store_id → stores` |
 | `store_operating_status` | 15분 슬롯별 영업유무/혼잡도 판정 | `(store_id, ts)` | `store_id → stores` |
 | `anomaly_events` | 안전감지 이상치 이벤트 | `event_id` | `meter_id → meters` |
+| `anomaly_narrations` | 요청 시 생성한 AI 분석(이벤트당 1건) | `event_id` | `event_id → anomaly_events` |
 | `google_places_cache` | Google Places 응답 원문 캐시 | `(store_id, fetched_at)` | `store_id → stores` |
 
 ### 설계 원칙 (알고 있으면 스키마가 훨씬 이해가 쉬움)
@@ -110,6 +112,14 @@ erDiagram
         timestamp detected_at
         text level "주의 / 위험"
     }
+    ANOMALY_EVENTS ||--o| ANOMALY_NARRATIONS : "event_id (분석을 요청한 이벤트만)"
+    ANOMALY_NARRATIONS {
+        bigint event_id PK, FK
+        text status "pending / done / failed"
+        text owner_sms
+        jsonb next_steps
+        timestamptz requested_at
+    }
     GOOGLE_PLACES_CACHE {
         int store_id FK
         timestamptz fetched_at PK
@@ -138,6 +148,7 @@ erDiagram
 | 4 | 상가 → 운영시간 | `store_operating_hours.store_id` | `stores.store_id` | CASCADE | 1:N | 상가 하나당 최대 14행 (source 2종 × 요일 7일) |
 | 5 | 상가 → 운영상태 | `store_operating_status.store_id` | `stores.store_id` | CASCADE | 1:N | `meter_timeseries`와 동일 15분 그리드, 단 계기가 아닌 상가 기준 |
 | 6 | 상가 → Places 캐시 | `google_places_cache.store_id` | `stores.store_id` | CASCADE | 1:N | 재호출 없이 재사용하려고 조회 시점(`fetched_at`)별 원문 보존 |
+| 7 | 이상치 → AI 분석 | `anomaly_narrations.event_id` | `anomaly_events.event_id` | CASCADE | 1:0..1 | 사용자가 분석을 요청한 이벤트에만 행이 있다. 이벤트가 재계산으로 지워지면 분석도 같이 지워진다 |
 
 모든 FK가 `ON DELETE CASCADE`입니다 — `meters`나 `stores`에서 행을 지우면 그 계기/상가에 딸린 시계열·운영시간·상태·이상치·캐시가 전부 같이 지워집니다. 데모 재실행 시 재매칭 스크립트가 `TRUNCATE`/재적재를 하는 것도 이 전제 위에서 안전합니다.
 
@@ -285,6 +296,37 @@ source별 이력을 보존합니다 — `google_places` 매칭이 성공해도 `
 | `created_at` | `TIMESTAMPTZ` | NOT NULL, 기본값 `now()` | |
 
 **인덱스:** `idx_anomaly_events_meter_detected ON (meter_id, detected_at)`.
+
+---
+
+### 6-1. `anomaly_narrations` — 안전감지 AI 분석 결과
+
+`anomaly_events` 한 건에 대해 **사용자가 AI 분석을 요청했을 때만** 행이 생깁니다. 감지된 이벤트마다 미리 만들어 두지 않습니다 — 요청하지 않은 분석에 외부 LLM을 쓰는 건 낭비이고, 여기 쌓인 행은 "누군가 실제로 요청했고 AI가 실제로 만든 결과"여야 의미가 있습니다. 한 번 만들어진 분석은 이 테이블에서 그대로 다시 읽습니다(재생성 요청은 범위 밖).
+
+| 컬럼 | 타입 | NULL | 설명 |
+|---|---|:---:|---|
+| `event_id` | `BIGINT` | PK, FK → `anomaly_events.event_id` | `ON DELETE CASCADE` — 이벤트가 재계산으로 지워지면 근거 수치가 사라진 문장이 남지 않도록 같이 지운다 |
+| `status` | `TEXT` | NOT NULL | CHECK: `pending` \| `done` \| `failed` (아래 참고) |
+| `owner_sms` | `TEXT` | ✓ | 점주용 문자(일상어). `done`일 때만 |
+| `admin_note` | `TEXT` | ✓ | 관리자용 점검 사유(규칙명·근거 수치) |
+| `emergency_report` | `TEXT` | ✓ | 신고 초안. 등급이 `위험`일 때만 |
+| `next_steps` | `JSONB` | NOT NULL, 기본값 `[]` | 점주 대처방안 목록 |
+| `inquiry_draft` | `TEXT` | ✓ | 한전·전기업체 문의 초안 |
+| `model` | `TEXT` | ✓ | 생성에 쓴 모델 |
+| `elapsed_ms` | `INTEGER` | ✓ | 생성 소요 시간 |
+| `verification_passed` | `BOOLEAN` | ✓ | 숫자 검증 결과. **통과한 결과만 `done`으로 저장**하므로 `done`이면 항상 `true` |
+| `unknown_numbers` | `JSONB` | NOT NULL, 기본값 `[]` | 검증에서 출처를 못 찾은 숫자 |
+| `error_message` | `TEXT` | ✓ | `failed`일 때 원인. 운영 확인용이고 화면에는 보내지 않는다 |
+| `requested_at` | `TIMESTAMPTZ` | NOT NULL, 기본값 `now()` | 분석 요청 시각 |
+| `completed_at` | `TIMESTAMPTZ` | ✓ | 완료·실패 시각 |
+
+**`status`가 필요한 이유:** 살아 있는 LLM이 24~57초(2026-09-10 실측)인데 앞단 프록시는 30초에서 연결을 끊습니다. 그래서 요청은 즉시 `pending`으로 응답하고 생성은 서버 백그라운드에서 하며, 화면은 `POST /api/anomalies/explain/status`로 완료를 확인합니다.
+
+- `failed`는 다시 요청하면 새로 시도합니다(외부 모델 장애는 일시적).
+- 생성 도중 서버가 재기동돼 작업이 사라지면 `pending`이 남는데, `NARRATION_STALE_MINUTES`(5분)가 지나면 `failed`로 보여 다시 요청할 수 있습니다.
+- 같은 이벤트를 여러 명이 동시에 요청해도 작업은 하나만 돕니다(`ami_db.serving.claim_narration`이 `INSERT ... ON CONFLICT ... WHERE`로 원자 처리).
+
+**PK:** `event_id` — 이벤트당 분석 1건.
 
 ---
 

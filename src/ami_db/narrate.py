@@ -14,6 +14,10 @@
 (verify_numbers). 라벨이 없어 성능 검증이 불가능했던 탐지 쪽과 달리, 이 계층은
 "틀렸는지 아닌지"를 자동으로 확인할 수 있다는 점이 채택 근거다.
 
+이 모듈은 "이벤트 -> 검증된 문장"까지만 책임진다. 언제 만들지(사용자가 요청했을 때만)와
+만든 결과를 어디에 둘지(DB anomaly_narrations)는 호출부 몫이다 - app/serving_api.py의
+백그라운드 작업과 ami_db.serving의 저장 함수 참고.
+
 의존성을 늘리지 않으려고 표준 라이브러리 urllib만 쓴다(서버 배포 시 uv sync로
 새 패키지를 받아야 하는 실패 지점을 만들지 않기 위함).
 """
@@ -27,32 +31,21 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from .config import CACHE_DIR, GENERATED_DIR, settings
+from .config import settings
 
 API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-# 타임아웃 상한은 **앞단 프록시가 정한다**. 실측(2026-09-10): 서버 nginx가 60초,
-# Next.js 프록시가 30초에서 연결을 끊는다. 이걸 넘기면 사용자는 응답 대신 502/504를 본다.
+# 생성은 요청 핸들러가 아니라 **백그라운드 작업**에서 돈다(app/serving_api.py 참고). 그래서
+# 앞단 프록시(30초)가 아니라 모델 응답 시간이 예산을 정한다 - 2026-09-10 실측으로 살아 있던
+# 모델이 24~57초(gemma는 한 번 73초)였다. 예전엔 요청을 붙잡고 27초 안에 끝내려다 거의 매번
+# 실패했고, 그 실패가 사용자에게 에러 화면으로 나갔다.
 #
-# 예산을 모델별로 따로 주지 않고 **전체 한도(LIVE_BUDGET_SEC)를 나눠 쓴다.** 예전엔
-# 1순위 10초 + 대체 14초로 각각 고정했는데, 1순위가 404로 0.2초 만에 죽는 날에도 대체
-# 모델은 여전히 14초만 쓸 수 있어 남은 시간을 버렸다. 반대로 1순위가 끝까지 물고 늘어지면
-# 대체까지 시도하다 프록시 한도를 넘겼다. 남은 시간을 계산해서 넘기면 두 경우 다 풀린다.
-LIVE_BUDGET_SEC = 27       # 프록시 30초에서 응답 직렬화/네트워크 몫을 뺀 값
-PER_MODEL_TIMEOUT_SEC = 22  # 한 모델이 예산을 전부 삼키지 않도록 하는 상한
-MIN_ATTEMPT_SEC = 4         # 이보다 적게 남았으면 시도해봐야 의미가 없다
-
-# 2026-09-10 현재 살아 있는 모델은 전부 24~57초라 **라이브 호출은 이 예산 안에 못 들어오는
-# 날이 더 많다.** 그래서 시연 신뢰성은 캐시가 담보한다(scripts/20_warm_narration_cache.py로
-# 미리 채운다). 라이브는 캐시에 없는 이벤트를 위한 보조 경로로 남겨둔다.
-# 캐시를 두 곳으로 나눈다.
-#   SEED_PATH: git에 커밋된 읽기 전용 시드. 새로 배포한 서버에도 데모용 설명이 처음부터
-#              들어 있게 한다.
-#   CACHE_PATH: 런타임이 실제로 쓰는 파일. output/generated는 이미 gitignore라 서버에서
-#              파일이 변경돼도 git pull과 충돌하지 않는다.
-# 처음엔 시드 파일 하나에 런타임 쓰기까지 했다가, 배포 때마다 "local changes would be
-# overwritten by merge"로 git pull이 막히는 것을 실측하고 분리했다.
-SEED_PATH = CACHE_DIR / "narration_cache.json"
-CACHE_PATH = GENERATED_DIR / "narration_cache.json"
+# 예산은 모델별로 따로 주지 않고 **전체 한도를 나눠 쓴다.** 1순위가 404로 0.2초 만에 죽는
+# 날엔 대체 모델이 남은 시간을 다 쓸 수 있고, 1순위가 끝까지 물고 늘어져도 전체가 이 한도를
+# 넘지 않는다. 합계는 serving.NARRATION_STALE_MINUTES(5분)보다 짧아야 한다 - 그보다 길면
+# 멀쩡히 진행 중인 작업을 "사라진 작업"으로 오판해 중복 실행한다.
+JOB_BUDGET_SEC = 180
+PER_MODEL_TIMEOUT_SEC = 90  # 한 모델이 예산을 전부 삼키지 않도록 하는 상한
+MIN_ATTEMPT_SEC = 10        # 이보다 적게 남았으면 시도해봐야 의미가 없다
 
 # 점주 안내에 쓸 수 있는 사실만 모아둔 참고 자료.
 #
@@ -173,10 +166,11 @@ def build_prompt_payload(event: dict) -> dict:
 
 class NarrationUnavailable(RuntimeError):
     """
-    외부 모델이 모두 실패하고 캐시도 없어 설명문을 만들 수 없는 상태.
+    외부 모델이 모두 실패해(호출 오류·파싱 실패·숫자 검증 실패) 설명문을 만들 수 없는 상태.
 
-    "API 키가 없다"(RuntimeError)와 구분하려고 따로 둔다 - 호출부가 전자는 503,
-    후자는 502로 내보내야 로그만 보고 원인을 오해하지 않는다.
+    "API 키가 없다"(RuntimeError)와 구분하려고 따로 둔다. 둘 다 사용자에게는 HTTP 에러가
+    아니라 status='failed' 안내로 전달되지만, 운영 기록(anomaly_narrations.error_message)을
+    보고 원인을 오해하지 않게 한다.
     """
 
 
@@ -188,55 +182,11 @@ class NarrationResult:
     model: str
     elapsed_ms: int
     verification_passed: bool
-    # 점주가 "그래서 뭘 어쩌라는 거지?"에 답하는 부분. 기본값을 둬서 이 필드가 없던
-    # 시절에 저장된 캐시 항목(NarrationResult(**cached))도 그대로 읽힌다.
+    # 점주가 "그래서 뭘 어쩌라는 거지?"에 답하는 부분.
     next_steps: list[str] = field(default_factory=list)
     inquiry_draft: str | None = None
     unknown_numbers: list[str] = field(default_factory=list)
     raw_output: str = ""
-    # "live"=이번에 생성, "cache"=이전 생성분 재사용(LLM API 장애 시). 화면·응답에 그대로
-    # 노출해서 "지금 만든 문장인지 저장해둔 문장인지"를 감추지 않는다.
-    source: str = "live"
-
-
-def _cache_key(event: dict) -> str:
-    return f"{event.get('store_id')}:{_fmt_ts(event.get('detected_at'))}"
-
-
-def _read_json(path) -> dict:
-    if not path.exists():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def _load_cache() -> dict:
-    """시드(커밋본) 위에 런타임 캐시를 덮어쓴 결과. 런타임에 새로 만든 게 항상 우선한다."""
-    return {**_read_json(SEED_PATH), **_read_json(CACHE_PATH)}
-
-
-def _save_cache(key: str, result: "NarrationResult") -> None:
-    """런타임 캐시에만 쓴다(시드는 커밋본이라 건드리지 않는다)."""
-    cache = _read_json(CACHE_PATH)
-    cache[key] = {
-        "owner_sms": result.owner_sms,
-        "admin_note": result.admin_note,
-        "emergency_report": result.emergency_report,
-        "next_steps": result.next_steps,
-        "inquiry_draft": result.inquiry_draft,
-        "model": result.model,
-        "elapsed_ms": result.elapsed_ms,
-        "verification_passed": result.verification_passed,
-        "unknown_numbers": result.unknown_numbers,
-    }
-    try:
-        CACHE_PATH.write_text(
-            json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-    except OSError:
-        pass  # 캐시 저장 실패가 응답 자체를 막을 이유는 없다
 
 
 def _number_tokens(text: str) -> list[str]:
@@ -254,8 +204,8 @@ def _norm(token: str) -> float | None:
 # 프롬프트에 넣는 수치는 build_prompt_payload가 소수 둘째 자리로 반올림한다. 그래서 모델이
 # 그대로 받아 적은 값도 원본과 최대 0.005만큼 벌어질 수 있다(0.4649 -> "0.46").
 # 비율 오차(0.5%)만 쓰면 작은 값에서 이 폭을 못 덮는다 - 0.46의 0.5%는 0.0023뿐이라
-# **임계값을 정확히 인용한 문장이 환각으로 찍혔다**(실측: 0.46 / 0.66). 화면은 검증에
-# 실패한 설명을 숨기므로, 이 오탐은 멀쩡한 설명을 조용히 지워버린다.
+# **임계값을 정확히 인용한 문장이 환각으로 찍혔다**(실측: 0.46 / 0.66). 검증에 실패한
+# 문장은 저장하지 않으므로, 이 오탐은 멀쩡한 분석을 조용히 버리게 만든다.
 ROUNDING_TOLERANCE = 0.005
 
 
@@ -310,7 +260,7 @@ def build_allowed_numbers(event: dict) -> set[float]:
 
     # 지속시간의 분<->시간 환산도 허용한다. 규칙 문구는 "60분 지속"이라고 적지만 점주가
     # 읽을 문장은 "한 시간 넘게"/"1시간 이상"으로 쓰는 게 자연스럽고, 실제로 그렇게 나온다.
-    # 단위를 바꿔 적은 것을 환각으로 세면 멀쩡한 문장이 화면에서 사라진다(실측: '1').
+    # 단위를 바꿔 적은 것을 환각으로 세면 멀쩡한 문장이 버려진다(실측: '1').
     for minutes in re.findall(r"(\d+)\s*분", rule_text):
         allowed.add(int(minutes) / 60)
 
@@ -321,7 +271,7 @@ def build_allowed_numbers(event: dict) -> set[float]:
             allowed.add(v)
 
     # 참고 안내사항에 든 수치(고객센터 123, 720시간 특례, 20kW 기준 등)도 입력의 일부이므로
-    # 허용한다. 이걸 빼면 대처방안 문장이 통째로 "확인 필요"로 찍혀 검증이 무의미해진다.
+    # 허용한다. 이걸 빼면 대처방안 문장이 통째로 검증 실패로 찍혀 검증이 무의미해진다.
     for token in _number_tokens(OWNER_GUIDANCE):
         v = _norm(token)
         if v is not None:
@@ -407,8 +357,12 @@ def _call_llm(event: dict, model: str, timeout: int = PER_MODEL_TIMEOUT_SEC) -> 
     return payload["choices"][0]["message"]["content"], elapsed_ms
 
 
-def _narrate_with_model(event: dict, model: str, timeout: int) -> NarrationResult:
-    raw, elapsed_ms = _call_llm(event, model, timeout)
+def _parse_and_verify(event: dict, raw: str, model: str, elapsed_ms: int) -> NarrationResult:
+    """
+    모델 원문 -> 필드 추출 + 숫자 검증. 호출(_call_llm)과 분리해 둔 이유는
+    scripts/19_langgraph_narration_pipeline.py가 "호출"과 "검사"를 별도 노드로 보여주면서도
+    이 로직을 재구현하지 않고 그대로 부르게 하기 위함이다.
+    """
     parsed = _extract_json(raw)
 
     owner_sms = str(parsed.get("owner_sms", "")).strip()
@@ -446,37 +400,36 @@ def _narrate_with_model(event: dict, model: str, timeout: int) -> NarrationResul
         verification_passed=not unknown,
         unknown_numbers=unknown,
         raw_output=raw,
-        source="live",
     )
 
 
-def narrate_event(
-    event: dict, model: str | None = None, prefer_cache: bool = False
-) -> NarrationResult:
+def _narrate_with_model(event: dict, model: str, timeout: int) -> NarrationResult:
+    raw, elapsed_ms = _call_llm(event, model, timeout)
+    return _parse_and_verify(event, raw, model, elapsed_ms)
+
+
+def narrate_event(event: dict, model: str | None = None) -> NarrationResult:
     """
-    이벤트 dict -> 점주 문자/관리자 사유/(위험이면) 신고 초안 + 숫자 검증 결과.
+    이벤트 dict -> 점주 문자/관리자 사유/(위험이면) 신고 초안/대처방안/문의 초안.
 
     event는 DB에서 조회한 값으로 채워야 한다(클라이언트가 보낸 수치를 그대로 쓰면
     임의의 값을 LLM에 먹일 수 있어 설명의 신뢰가 무너진다 - serving.get_anomaly_event 참고).
 
-    3단 방어: 1순위 모델 -> 대체 모델 -> 캐시. 호스팅 LLM은 예고 없이 응답 불능이 되므로
-    (실측: mistral-nemotron이 2.8초에서 60초 타임아웃으로 급변) 라이브 호출 실패가 곧
-    화면 실패가 되지 않게 한다. 캐시본을 쓸 때는 source="cache"로 그 사실을 드러낸다.
-    """
-    # prefer_cache: 이미 만들어 둔 설명이 있으면 라이브 호출 없이 즉시 돌려준다.
-    # 외부 모델이 느린 날 시연할 때 쓰는 옵션이다 - 라이브를 먼저 시도하면 두 모델이
-    # 타임아웃될 때까지 24초를 기다린 뒤에야 같은 캐시본을 받게 되기 때문이다.
-    if prefer_cache:
-        cached = _load_cache().get(_cache_key(event))
-        if cached:
-            return NarrationResult(**cached, raw_output="", source="cache")
+    1순위 모델 -> 대체 모델 순으로 시도한다. 호스팅 LLM은 예고 없이 응답 불능이 된다
+    (실측: 1순위였던 mistral-nemotron이 2.8초에서 무응답으로 급변).
 
+    **숫자 검증을 통과한 결과만 돌려준다.** 검증에 실패한 문장은 화면이 어차피 보여주지
+    않는데, 그걸 저장하면 재생성 기능이 없는 이상 그 이벤트는 영영 빈칸이 된다. 그래서
+    검증 실패도 호출 실패와 똑같이 다음 모델에게 넘긴다.
+
+    예외: RuntimeError(API 키 없음) / NarrationUnavailable(모든 모델 실패).
+    """
     if not settings.nvidia_api_key:
         raise RuntimeError("NVIDIA_API_KEY가 설정되지 않았습니다 (db/.env 확인).")
 
     candidates = [model] if model else [settings.nvidia_model, settings.nvidia_model_fallback]
     errors: list[str] = []
-    deadline = time.time() + LIVE_BUDGET_SEC
+    deadline = time.time() + JOB_BUDGET_SEC
     for candidate in [c for c in candidates if c]:
         remaining = deadline - time.time()
         if remaining < MIN_ATTEMPT_SEC:
@@ -487,20 +440,15 @@ def narrate_event(
                 event, candidate, int(min(PER_MODEL_TIMEOUT_SEC, remaining))
             )
         except Exception as e:  # noqa: BLE001 - 어떤 실패든 다음 후보로 넘어간다
-            # 예외 타입만 남기면 "왜 실패했는지"를 로그에서 알 수 없어 원인 추적이 막힌다
-            # (실제로 502의 원인이 모델 사망인지 파싱 실패인지 구분하는 데 시간을 썼다).
+            # 예외 타입만 남기면 "왜 실패했는지"를 기록에서 알 수 없어 원인 추적이 막힌다
+            # (실제로 모델 사망인지 파싱 실패인지 구분하는 데 시간을 썼다).
             # 메시지도 함께 남기되 혹시 섞여 들어올 수 있는 키 문자열은 지운다.
             detail = re.sub(r"nvapi-[A-Za-z0-9_\-]+", "***", str(e))[:120]
             errors.append(f"{candidate}: {type(e).__name__}({detail})")
             continue
-        _save_cache(_cache_key(event), result)
+        if not result.verification_passed:
+            errors.append(f"{candidate}: 숫자검증실패({', '.join(result.unknown_numbers)})")
+            continue
         return result
 
-    cached = _load_cache().get(_cache_key(event))
-    if cached:
-        return NarrationResult(**cached, raw_output="", source="cache")
-
-    # RuntimeError를 쓰지 않는다 - 호출부(serving_api)가 RuntimeError를 "API 키 미설정"으로
-    # 보고 503을 내는데, 여기는 키 문제가 아니라 외부 모델 장애다. 실제로 로그에 503이
-    # 찍혀 키가 빠진 것처럼 오해를 샀다(2026-09-10). 502로 구분되도록 다른 예외를 쓴다.
-    raise NarrationUnavailable(f"설명문 생성 실패(캐시도 없음) - 시도: {', '.join(errors)}")
+    raise NarrationUnavailable(f"설명문 생성 실패 - 시도: {' / '.join(errors)}")

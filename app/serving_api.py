@@ -26,13 +26,15 @@ from typing import Literal
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from fastapi import FastAPI, HTTPException, Query  # noqa: E402
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query  # noqa: E402
 
+from ami_db.config import settings  # noqa: E402
 from ami_db.db import get_engine  # noqa: E402
 from ami_db.serving import (  # noqa: E402
     EARLIEST_SAMPLE_DATE,
     LATEST_SERVICE_DATE,
     LATEST_SNAPSHOT_DATE,
+    claim_narration,
     get_all_stores,
     get_anomalies,
     get_anomaly_event,
@@ -41,14 +43,17 @@ from ami_db.serving import (  # noqa: E402
     get_current_status_all,
     get_current_status_one,
     get_meter_day_series,
+    get_narration,
     get_store_day_series,
     get_store_detail,
     get_store_hours,
     get_store_status_day,
     get_stores_snapshot,
     parse_snapshot_time,
+    save_narration_done,
+    save_narration_failed,
 )
-from ami_db.narrate import NarrationUnavailable, narrate_event  # noqa: E402
+from ami_db.narrate import narrate_event  # noqa: E402
 from app.schemas import (  # noqa: E402
     AnomalyExplainRequest,
     AnomalyExplainResponse,
@@ -415,30 +420,19 @@ def anomalies_period(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post(
-    "/api/anomalies/explain", tags=["안전감지"], summary="감지 이벤트 설명문 생성 (LLM)",
-    response_model=AnomalyExplainResponse,
-)
-def explain_anomaly(body: AnomalyExplainRequest):
-    """
-    이미 규칙이 확정한 이벤트를 **사람이 읽을 문장으로 옮기는** 엔드포인트다.
-    점주용 문자 초안 / 관리자용 점검 사유 / (위험이면) 신고 접수용 초안을 돌려준다.
+# AI 분석 응답의 안내문. **실패를 HTTP 에러로 던지지 않는다.** 분석이 아직 없거나 외부
+# 모델이 죽은 것은 "시스템이 고장 난" 게 아니라 "분석이 아직/지금은 없는" 상태이고,
+# 사용자는 에러 화면이 아니라 무슨 상황인지를 봐야 한다. 감지(규칙 판정) 자체는 AI와
+# 무관하게 이미 정확하므로 그 사실을 함께 알린다.
+_ANALYSIS_MESSAGES = {
+    "none": "아직 AI 분석을 요청하지 않았습니다.",
+    "pending": "AI가 분석하고 있습니다. 완료되면 이 자리에 표시됩니다.",
+    "failed": "AI 분석을 완료하지 못했습니다. 잠시 후 다시 요청해 주세요. 감지 결과는 그대로 정확합니다.",
+    "unavailable": "지금은 AI 분석을 사용할 수 없습니다(시스템 설정 문제). 감지 결과는 그대로 정확합니다.",
+}
 
-    **LLM은 판정에 관여하지 않는다.** 등급(`level`)과 발동 규칙(`rule_triggered`)은
-    `ami_db.anomaly`의 규칙이 이미 결정한 값을 그대로 싣고, 모델은 그것을 설명만 한다.
-    탐지에 AI를 쓰지 않는 이유는 실측 비교(규칙 F1 0.698 vs Isolation Forest 0.582)와
-    KEC 212.3이라는 법정 근거를 확률 모델로 대체할 수 없다는 판단 때문이다.
 
-    **환각 방지 장치 2가지**:
-    1. 수치는 클라이언트가 보낸 값이 아니라 `anomaly_events`에서 다시 읽는다 - 임의의
-       값을 넣어 그럴듯한 설명을 만들어내는 것을 원천 차단한다.
-    2. 생성된 문장의 모든 숫자를 입력 수치와 자동 대조한다(`verification_passed`).
-       입력에 없던 숫자가 섞이면 `unknown_numbers`에 담겨 함께 반환되므로, 화면에서
-       그대로 신뢰할지 사람이 판단할 수 있다.
-
-    해당 (store_id, detected_at) 이벤트가 없으면 404, 서버에 `NVIDIA_API_KEY`가
-    설정돼 있지 않으면 503(다른 엔드포인트는 정상 동작).
-    """
+def _find_event_or_404(body: AnomalyExplainRequest) -> dict:
     event = get_anomaly_event(_engine, body.store_id, body.detected_at)
     if event is None:
         raise HTTPException(
@@ -446,32 +440,123 @@ def explain_anomaly(body: AnomalyExplainRequest):
             detail=f"store_id={body.store_id}, detected_at={body.detected_at.isoformat()}에 "
                    "해당하는 감지 이벤트가 없습니다 (GET /api/anomalies/snapshot의 값을 그대로 넘기세요).",
         )
-    try:
-        result = narrate_event(event, prefer_cache=body.prefer_cache)
-    except NarrationUnavailable as e:  # 외부 모델 전부 실패 + 캐시 없음
-        raise HTTPException(status_code=502, detail=str(e))
-    except RuntimeError as e:  # API 키 미설정
-        raise HTTPException(status_code=503, detail=str(e))
-    except Exception as e:  # LLM 응답 파싱 실패 등
-        raise HTTPException(status_code=502, detail=f"설명문 생성에 실패했습니다: {e}")
+    return event
 
-    return {
+
+def _analysis_response(event: dict, row: dict | None, *, override: str | None = None) -> dict:
+    """규칙 판정 결과(event) + 저장된 분석(anomaly_narrations 행) -> AnomalyExplainResponse."""
+    base = {
         "store_id": event["store_id"],
         "store_name": event["store_name"],
         "detected_at": event["detected_at"],
         "level": event["level"],
         "rule_triggered": event["rule_triggered"],
-        "owner_sms": result.owner_sms,
-        "admin_note": result.admin_note,
-        "emergency_report": result.emergency_report,
-        "next_steps": result.next_steps,
-        "inquiry_draft": result.inquiry_draft,
-        "verification_passed": result.verification_passed,
-        "unknown_numbers": result.unknown_numbers,
-        "model": result.model,
-        "elapsed_ms": result.elapsed_ms,
-        "source": result.source,
     }
+    if override:  # 'unavailable' - DB에 아무것도 쓰지 않고 안내만 돌려준다
+        return {**base, "status": "failed", "message": _ANALYSIS_MESSAGES[override]}
+    if row is None:
+        return {**base, "status": "none", "message": _ANALYSIS_MESSAGES["none"]}
+
+    status = row["status"]
+    # 서버 재기동으로 작업이 사라진 오래된 pending은 실패로 보여줘야 다시 요청할 수 있다
+    # (claim_narration도 같은 기준으로 재시작을 허용한다).
+    if status == "pending" and row["stale"]:
+        status = "failed"
+    if status != "done":
+        return {**base, "status": status, "message": _ANALYSIS_MESSAGES[status],
+                "requested_at": row["requested_at"]}
+    return {
+        **base,
+        "status": "done",
+        "message": None,
+        "owner_sms": row["owner_sms"],
+        "admin_note": row["admin_note"],
+        "emergency_report": row["emergency_report"],
+        "next_steps": row["next_steps"] or [],
+        "inquiry_draft": row["inquiry_draft"],
+        "verification_passed": row["verification_passed"],
+        "unknown_numbers": row["unknown_numbers"] or [],
+        "model": row["model"],
+        "elapsed_ms": row["elapsed_ms"],
+        "requested_at": row["requested_at"],
+        "completed_at": row["completed_at"],
+    }
+
+
+def _run_analysis_job(event: dict) -> None:
+    """
+    백그라운드 작업: AI 생성 -> 성공하면 DB에 done, 실패하면 failed로 남긴다.
+
+    요청 핸들러는 이 작업을 걸어두고 즉시 'pending'으로 응답한다. 살아 있는 모델이 전부
+    24~57초(2026-09-10 실측)라 요청을 붙잡고 기다리면 앞단 프록시(30초)가 먼저 연결을
+    끊어 사용자는 결국 에러를 보게 된다 - 생성과 응답을 분리한 이유다.
+    """
+    try:
+        result = narrate_event(event)
+    except Exception as e:  # noqa: BLE001 - 어떤 실패든 요청자에겐 'failed' 상태로 전달된다
+        detail = f"{type(e).__name__}: {e}"[:500]
+        print(f"[ai-analysis] event_id={event['event_id']} 실패 - {detail}", flush=True)
+        save_narration_failed(_engine, event["event_id"], detail)
+        return
+    save_narration_done(_engine, event["event_id"], result)
+    print(f"[ai-analysis] event_id={event['event_id']} 완료 "
+          f"({result.model}, {result.elapsed_ms}ms)", flush=True)
+
+
+@app.post(
+    "/api/anomalies/explain", tags=["안전감지"],
+    summary="AI 분석 요청 (저장본이 있으면 즉시 반환, 없으면 생성 시작)",
+    response_model=AnomalyExplainResponse,
+)
+def request_anomaly_analysis(body: AnomalyExplainRequest, background_tasks: BackgroundTasks):
+    """
+    감지 이벤트에 대한 AI 분석(점주 문자 / 점검 사유 / 신고 초안 / 대처방안 / 문의 초안)을
+    **요청한다.** 분석은 사용자가 요청했을 때만 만들고, 만든 결과는 DB(`anomaly_narrations`)에
+    저장해 다음부터는 그대로 읽는다. 감지된 이벤트마다 미리 만들어 두지 않는다.
+
+    - 이미 분석된 이벤트 -> `status='done'`과 저장된 결과를 **즉시** 반환(AI를 다시 부르지 않음)
+    - 처음 요청 -> 백그라운드에서 생성을 시작하고 즉시 `status='pending'`으로 응답.
+      완료 여부는 `POST /api/anomalies/explain/status`로 확인한다.
+    - 이전 시도가 실패했으면(`failed`) 다시 요청할 때 새로 시도한다.
+
+    **AI 실패는 HTTP 에러가 아니다.** 외부 모델이 죽었거나 키가 없어도 200과 함께
+    `status='failed'`와 화면에 그대로 띄울 안내문(`message`)을 준다. 404는 해당
+    (store_id, detected_at) 감지 이벤트 자체가 없을 때뿐이다.
+
+    **LLM은 판정에 관여하지 않는다.** 등급(`level`)과 발동 규칙(`rule_triggered`)은 규칙이
+    이미 확정한 값이고(규칙 F1 0.698 vs Isolation Forest 0.582, KEC 212.3 법정 근거),
+    수치는 클라이언트 입력이 아니라 `anomaly_events`에서 다시 읽는다. 생성된 문장의 숫자는
+    입력 수치와 자동 대조해 **검증을 통과한 결과만 저장한다.**
+    """
+    event = _find_event_or_404(body)
+    row = get_narration(_engine, event["event_id"])
+    if row and row["status"] == "done":
+        return _analysis_response(event, row)  # DB 저장본 - AI를 다시 부르지 않는다
+    if not settings.nvidia_api_key:
+        return _analysis_response(event, None, override="unavailable")
+    if claim_narration(_engine, event["event_id"]):
+        background_tasks.add_task(_run_analysis_job, event)
+    # 다시 읽는다 - 방금 이 요청이 맡은 pending일 수도, 다른 요청이 이미 진행 중이거나
+    # 끝낸 상태일 수도 있다(같은 이벤트를 두 사람이 동시에 눌러도 작업은 하나만 돈다).
+    return _analysis_response(event, get_narration(_engine, event["event_id"]))
+
+
+@app.post(
+    "/api/anomalies/explain/status", tags=["안전감지"],
+    summary="AI 분석 상태 조회 (새로 생성하지 않음)",
+    response_model=AnomalyExplainResponse,
+)
+def get_anomaly_analysis_status(body: AnomalyExplainRequest):
+    """
+    AI 분석의 현재 상태를 **읽기만** 한다 - 여기서는 절대 생성을 시작하지 않는다.
+    `POST /api/anomalies/explain`이 `pending`을 돌려줬을 때 완료를 확인하는 용도다.
+
+    `status`: `none`(요청된 적 없음) | `pending`(생성 중) | `done`(완료, 결과 포함) |
+    `failed`(실패 - 다시 요청 가능). 생성 중 서버가 재기동돼 작업이 사라진 경우도
+    일정 시간(`NARRATION_STALE_MINUTES`)이 지나면 `failed`로 보여 다시 요청할 수 있다.
+    """
+    event = _find_event_or_404(body)
+    return _analysis_response(event, get_narration(_engine, event["event_id"]))
 
 
 @app.post(

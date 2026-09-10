@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-2-2단계: sql/schema.sql을 실행해 7개 테이블을 생성한다.
+2-2단계: sql/schema.sql을 실행해 8개 테이블을 생성한다.
+
+운영 서버에서 새 테이블만 추가할 때도 이 스크립트를 옵션 없이 그대로 돌리면 된다 -
+schema.sql은 CREATE ... IF NOT EXISTS뿐이고 아래 마이그레이션도 전부 멱등이라 기존
+데이터는 건드리지 않는다(예: 2026-09-10 anomaly_narrations 추가).
 
 --reset을 주면 기존 테이블을 CASCADE로 먼저 지우고 새로 만든다(개발 중 스키마를
 바꿔가며 반복 실행하기 위함). 기본(옵션 없음)은 CREATE TABLE IF NOT EXISTS라서
@@ -21,6 +25,7 @@ SCHEMA_SQL_PATH = Path(__file__).resolve().parents[1] / "sql" / "schema.sql"
 # 의존성 역순으로 나열한다: meters를 참조하는 테이블들을 먼저, meters를 마지막에).
 TABLES_DROP_ORDER = [
     "google_places_cache",
+    "anomaly_narrations",
     "anomaly_events",
     "store_operating_status",
     "store_operating_hours",
@@ -134,7 +139,7 @@ def main() -> None:
             print("마이그레이션: anomaly_events 슬롯 UNIQUE(증분 배치 멱등성)...")
             migrate_anomaly_slot_unique(cur)
 
-    print("완료: 7개 테이블 생성됨.")
+    print("완료: 8개 테이블 생성됨.")
 
 
 if __name__ == "__main__":

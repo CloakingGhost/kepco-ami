@@ -205,51 +205,29 @@ def notify(conn, events: list[dict]) -> None:
     사건에 속한 모든 슬롯의 notified_at을 채워, 같은 사건으로 두 번 알리지 않는 흐름만
     완성해 둔다. 실제 채널을 붙일 때 이 함수 안만 바꾸면 되도록 경계를 여기로 모았다.
 
-    문구는 LLM 설명 계층(ami_db.narrate)을 재사용하되, 외부 API가 느리거나 죽어 있어도
-    배치가 멈추면 안 되므로 캐시 우선(prefer_cache=True)으로 호출하고 실패하면 템플릿으로
-    떨어진다. 이벤트 정보는 **같은 커넥션에서** 읽는다 - 방금 INSERT한 행은 커밋 전이라
-    다른 커넥션(get_engine)으로는 보이지 않아 항상 템플릿으로 떨어지는 문제가 있었다.
+    문구는 **수치 템플릿**으로 만든다. 예전엔 LLM 설명 계층(ami_db.narrate)을 불러 문장을
+    만들었지만, "AI 분석은 사람이 요청했을 때만 생성한다"는 원칙(sql/schema.sql의
+    anomaly_narrations 주석)과 어긋난다. 알림의 역할은 이상 신호를 즉시 알리는 것이고,
+    무슨 일인지 풀어 쓴 설명이 필요하면 화면에서 AI 분석을 요청하면 된다. LLM이 24~57초
+    걸리는 날에도 배치 한 틱이 외부 모델에 묶이지 않는다는 이점도 있다.
     """
     if not events:
         return
 
-    from ami_db.narrate import narrate_event
-
     for episode in group_into_episodes(events):
         head, tail = episode[0], episode[-1]
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT s.store_id, s.name, s.biz_category_mid, m.contract_power_kw
-                FROM stores s JOIN meters m ON m.meter_id = s.meter_id
-                WHERE s.meter_id = %s
-                """,
-                (head["meter_id"],),
-            )
+            cur.execute("SELECT store_id, name FROM stores WHERE meter_id = %s", (head["meter_id"],))
             row = cur.fetchone()
         if not row:
             continue
-        store_id, store_name, biz_mid, contract_kw = row
+        store_id, store_name = row
 
-        # 사건 대표값: 가장 높았던 관측치가 있는 슬롯을 쓴다(설명문이 최악값을 말하게).
+        # 사건 대표값: 가장 높았던 관측치가 있는 슬롯을 쓴다(알림이 최악값을 말하게).
         peak = max(episode, key=lambda e: e["metric_value"])
-        event_for_llm = {
-            "store_id": store_id, "store_name": store_name, "biz_category_mid": biz_mid,
-            "contract_power_kw": contract_kw, "level": peak["level"],
-            "rule_triggered": peak["rule_triggered"], "detected_at": peak["detected_at"],
-            "metric_value": peak["metric_value"], "threshold_value": peak["threshold_value"],
-        }
-
-        message = None
-        try:
-            message = narrate_event(event_for_llm, prefer_cache=True).owner_sms
-        except Exception as e:  # noqa: BLE001 - 문구 생성 실패가 배치를 멈추면 안 된다
-            print(f"    (설명 생성 건너뜀: {type(e).__name__} - 템플릿으로 발송)")
-
-        if message is None:  # LLM을 못 쓰는 상황에서도 알림 자체는 나가야 한다
-            message = (f"[{peak['level']}] {head['detected_at']:%m-%d %H:%M}~"
-                       f"{tail['detected_at']:%H:%M} 비영업시간 전력 이상 감지 "
-                       f"(최대 {peak['metric_value']:.2f}kWh / 임계 {peak['threshold_value']:.2f}kWh)")
+        message = (f"[{peak['level']}] {head['detected_at']:%m-%d %H:%M}~"
+                   f"{tail['detected_at']:%H:%M} 비영업시간 전력 이상 감지 "
+                   f"(최대 {peak['metric_value']:.2f}kWh / 임계 {peak['threshold_value']:.2f}kWh)")
 
         span = f"{head['detected_at']:%H:%M}~{tail['detected_at']:%H:%M}"
         print(f"    [발송] {store_name}(store_id={store_id}) {span} 슬롯{len(episode)}건")

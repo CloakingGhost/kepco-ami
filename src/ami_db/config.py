@@ -28,8 +28,8 @@ class Settings(BaseSettings):
     # .env에 이 키가 없으면 죽는다. 실제 검증은 사용 시점(GooglePlacesClient.__init__)에서 한다.
     google_places_api_key: str = ""
 
-    # 안전감지 이벤트 설명문 생성(ami_db.narrate)용. 같은 이유로 빈 문자열 기본값이며,
-    # 없으면 /api/anomalies/explain만 503으로 응답하고 나머지 API는 정상 동작한다.
+    # 안전감지 이벤트 AI 분석(ami_db.narrate)용. 같은 이유로 빈 문자열 기본값이며,
+    # 없으면 AI 분석 요청만 "지금은 사용할 수 없음" 안내로 응답하고 나머지 API는 정상 동작한다.
     # NVIDIA API Catalog(OpenAI 호환 엔드포인트)를 쓴다 - 키 형식은 'nvapi-...'.
     nvidia_api_key: str = ""
     # 예비 키. 1순위 키가 rate limit(429)이나 인증 거부(401/403)를 맞으면 이 키로 한 번 더
@@ -82,9 +82,3 @@ VIZ_OUTPUT = REPO_ROOT / "visualize_analyis_data" / "output"
 DATA_DIR = REPO_ROOT / "data"
 GENERATED_DIR = DB_ROOT / "output" / "generated"
 GENERATED_DIR.mkdir(parents=True, exist_ok=True)
-
-# LLM 설명문 캐시. output/generated와 달리 **git에 포함**시킨다 - 외부 LLM API가 죽어도
-# 배포본만으로 화면이 동작해야 하기 때문이다(호스팅 모델이 예고 없이 응답 불능이 되는 것을
-# 실측으로 확인함, docs/LLM_모델선정_비교실험.md 4절).
-CACHE_DIR = DB_ROOT / "cache"
-CACHE_DIR.mkdir(parents=True, exist_ok=True)

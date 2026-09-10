@@ -3,7 +3,7 @@
 > 이 문서는 `scripts/generate_api_docs.py`가 FastAPI OpenAPI 스키마에서 **자동 생성**했습니다.
 > 코드(엔드포인트·모델)를 고쳤다면 재생성하세요: `uv run python scripts/generate_api_docs.py`
 >
-> 버전: `0.1.0` · 생성 시각: `2026-09-10 02:39 UTC`
+> 버전: `0.1.0` · 생성 시각: `2026-09-10 07:06 UTC`
 
 **Base URL(로컬)**: `http://localhost:8000`  (Swagger UI: `http://localhost:8000/docs`)
 
@@ -444,45 +444,83 @@ date/time을 둘 다 생략하면 서버 "현재" 기준(`ami_db.serving.service
 ---
 
 ### `POST /api/anomalies/explain`
-**감지 이벤트 설명문 생성 (LLM)**
+**AI 분석 요청 (저장본이 있으면 즉시 반환, 없으면 생성 시작)**
 
-이미 규칙이 확정한 이벤트를 **사람이 읽을 문장으로 옮기는** 엔드포인트다.
-점주용 문자 초안 / 관리자용 점검 사유 / (위험이면) 신고 접수용 초안을 돌려준다.
+감지 이벤트에 대한 AI 분석(점주 문자 / 점검 사유 / 신고 초안 / 대처방안 / 문의 초안)을
+**요청한다.** 분석은 사용자가 요청했을 때만 만들고, 만든 결과는 DB(`anomaly_narrations`)에
+저장해 다음부터는 그대로 읽는다. 감지된 이벤트마다 미리 만들어 두지 않는다.
 
-**LLM은 판정에 관여하지 않는다.** 등급(`level`)과 발동 규칙(`rule_triggered`)은
-`ami_db.anomaly`의 규칙이 이미 결정한 값을 그대로 싣고, 모델은 그것을 설명만 한다.
-탐지에 AI를 쓰지 않는 이유는 실측 비교(규칙 F1 0.698 vs Isolation Forest 0.582)와
-KEC 212.3이라는 법정 근거를 확률 모델로 대체할 수 없다는 판단 때문이다.
+- 이미 분석된 이벤트 -> `status='done'`과 저장된 결과를 **즉시** 반환(AI를 다시 부르지 않음)
+- 처음 요청 -> 백그라운드에서 생성을 시작하고 즉시 `status='pending'`으로 응답.
+  완료 여부는 `POST /api/anomalies/explain/status`로 확인한다.
+- 이전 시도가 실패했으면(`failed`) 다시 요청할 때 새로 시도한다.
 
-**환각 방지 장치 2가지**:
-1. 수치는 클라이언트가 보낸 값이 아니라 `anomaly_events`에서 다시 읽는다 - 임의의
-   값을 넣어 그럴듯한 설명을 만들어내는 것을 원천 차단한다.
-2. 생성된 문장의 모든 숫자를 입력 수치와 자동 대조한다(`verification_passed`).
-   입력에 없던 숫자가 섞이면 `unknown_numbers`에 담겨 함께 반환되므로, 화면에서
-   그대로 신뢰할지 사람이 판단할 수 있다.
+**AI 실패는 HTTP 에러가 아니다.** 외부 모델이 죽었거나 키가 없어도 200과 함께
+`status='failed'`와 화면에 그대로 띄울 안내문(`message`)을 준다. 404는 해당
+(store_id, detected_at) 감지 이벤트 자체가 없을 때뿐이다.
 
-해당 (store_id, detected_at) 이벤트가 없으면 404, 서버에 `NVIDIA_API_KEY`가
-설정돼 있지 않으면 503(다른 엔드포인트는 정상 동작).
+**LLM은 판정에 관여하지 않는다.** 등급(`level`)과 발동 규칙(`rule_triggered`)은 규칙이
+이미 확정한 값이고(규칙 F1 0.698 vs Isolation Forest 0.582, KEC 212.3 법정 근거),
+수치는 클라이언트 입력이 아니라 `anomaly_events`에서 다시 읽는다. 생성된 문장의 숫자는
+입력 수치와 자동 대조해 **검증을 통과한 결과만 저장한다.**
 
 **응답 (200)** — `AnomalyExplainResponse`
 
 | 필드 | 타입 | 설명 |
 |---|---|---|
+| `status` | `string` | none=요청된 적 없음 | pending=AI가 생성 중(백그라운드) | done=완료(DB 저장본) | failed=외부 AI 실패 또는 사용 불가(다시 요청 가능). **AI 실패는 HTTP 에러가 아니라 이 값으로 온다.** |
+| `message` | `string \| null` | 화면에 그대로 띄울 안내문(none/pending/failed일 때). done이면 null. |
 | `store_id` | `integer` |  |
 | `store_name` | `string \| null` |  |
 | `detected_at` | `string` |  |
 | `level` | `string` | '주의' | '위험' - 규칙이 이미 확정한 등급(LLM이 바꾸지 않음) |
 | `rule_triggered` | `string` |  |
-| `owner_sms` | `string` | 점주에게 보낼 문자 초안(2~3문장, 존댓말) |
-| `admin_note` | `string` | 관리자용 점검 사유(1~2문장, 발동 규칙과 근거 수치 명시) |
+| `owner_sms` | `string \| null` | 점주에게 보낼 문자 초안(2~3문장, 존댓말, 일상어). status='done'일 때만 채워진다. |
+| `admin_note` | `string \| null` | 관리자용 점검 사유(1~2문장, 발동 규칙과 근거 수치 명시). status='done'일 때만 채워진다. |
 | `emergency_report` | `string \| null` | 신고 접수용 초안. level='위험'일 때만 채워지고 '주의'면 null. |
 | `next_steps` | `string[]` | 점주가 지금 할 수 있는 조치 2~3가지. '감지했다'로 끝내지 않고 '그래서 뭘 하면 되는지'까지 안내하기 위한 필드. 근거는 프롬프트에 넣어둔 참고 안내사항(한전 증설 제도 등)뿐이며 모델이 제도를 지어내지 못한다. |
 | `inquiry_draft` | `string \| null` | 점주가 한전(고객센터 123 / cyber.kepco.co.kr)이나 전기공사 업체에 그대로 보낼 수 있는 문의 초안. |
-| `verification_passed` | `boolean` | 생성문에 입력에 없던 숫자가 섞였는지 자동 대조한 결과. false면 환각 의심 - unknown_numbers에 그 숫자가 담긴다. 판정 로직이 아니라 LLM 출력 검사다. |
+| `verification_passed` | `boolean \| null` | 생성문에 입력에 없던 숫자가 섞였는지 자동 대조한 결과(판정 로직이 아니라 LLM 출력 검사). 서버는 검증을 통과한 결과만 저장하므로 status='done'이면 항상 true. |
 | `unknown_numbers` | `string[]` | 입력 수치와 대조되지 않은 숫자 목록. 비어 있으면 통과. |
-| `model` | `string` | 생성에 사용한 모델 |
-| `elapsed_ms` | `integer` | LLM 호출 소요 시간(ms) |
-| `source` | `string` | 'live'=이번 호출로 생성 | 'cache'=외부 LLM API 장애로 이전 생성분을 재사용. 호스팅 모델이 예고 없이 응답 불능이 되는 것을 실측했기 때문에 둔 방어 장치이며, 캐시본을 쓴 사실을 숨기지 않는다. |
+| `model` | `string \| null` | 생성에 사용한 모델 |
+| `elapsed_ms` | `integer \| null` | AI 생성 소요 시간(ms) |
+| `requested_at` | `string \| null` | 분석을 요청한 시각 |
+| `completed_at` | `string \| null` | 분석이 끝난 시각(done일 때) |
+
+---
+
+### `POST /api/anomalies/explain/status`
+**AI 분석 상태 조회 (새로 생성하지 않음)**
+
+AI 분석의 현재 상태를 **읽기만** 한다 - 여기서는 절대 생성을 시작하지 않는다.
+`POST /api/anomalies/explain`이 `pending`을 돌려줬을 때 완료를 확인하는 용도다.
+
+`status`: `none`(요청된 적 없음) | `pending`(생성 중) | `done`(완료, 결과 포함) |
+`failed`(실패 - 다시 요청 가능). 생성 중 서버가 재기동돼 작업이 사라진 경우도
+일정 시간(`NARRATION_STALE_MINUTES`)이 지나면 `failed`로 보여 다시 요청할 수 있다.
+
+**응답 (200)** — `AnomalyExplainResponse`
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `status` | `string` | none=요청된 적 없음 | pending=AI가 생성 중(백그라운드) | done=완료(DB 저장본) | failed=외부 AI 실패 또는 사용 불가(다시 요청 가능). **AI 실패는 HTTP 에러가 아니라 이 값으로 온다.** |
+| `message` | `string \| null` | 화면에 그대로 띄울 안내문(none/pending/failed일 때). done이면 null. |
+| `store_id` | `integer` |  |
+| `store_name` | `string \| null` |  |
+| `detected_at` | `string` |  |
+| `level` | `string` | '주의' | '위험' - 규칙이 이미 확정한 등급(LLM이 바꾸지 않음) |
+| `rule_triggered` | `string` |  |
+| `owner_sms` | `string \| null` | 점주에게 보낼 문자 초안(2~3문장, 존댓말, 일상어). status='done'일 때만 채워진다. |
+| `admin_note` | `string \| null` | 관리자용 점검 사유(1~2문장, 발동 규칙과 근거 수치 명시). status='done'일 때만 채워진다. |
+| `emergency_report` | `string \| null` | 신고 접수용 초안. level='위험'일 때만 채워지고 '주의'면 null. |
+| `next_steps` | `string[]` | 점주가 지금 할 수 있는 조치 2~3가지. '감지했다'로 끝내지 않고 '그래서 뭘 하면 되는지'까지 안내하기 위한 필드. 근거는 프롬프트에 넣어둔 참고 안내사항(한전 증설 제도 등)뿐이며 모델이 제도를 지어내지 못한다. |
+| `inquiry_draft` | `string \| null` | 점주가 한전(고객센터 123 / cyber.kepco.co.kr)이나 전기공사 업체에 그대로 보낼 수 있는 문의 초안. |
+| `verification_passed` | `boolean \| null` | 생성문에 입력에 없던 숫자가 섞였는지 자동 대조한 결과(판정 로직이 아니라 LLM 출력 검사). 서버는 검증을 통과한 결과만 저장하므로 status='done'이면 항상 true. |
+| `unknown_numbers` | `string[]` | 입력 수치와 대조되지 않은 숫자 목록. 비어 있으면 통과. |
+| `model` | `string \| null` | 생성에 사용한 모델 |
+| `elapsed_ms` | `integer \| null` | AI 생성 소요 시간(ms) |
+| `requested_at` | `string \| null` | 분석을 요청한 시각 |
+| `completed_at` | `string \| null` | 분석이 끝난 시각(done일 때) |
 
 ---
 
