@@ -356,6 +356,21 @@ class AnomalyExplainResponse(BaseModel):
         default=None,
         description="신고 접수용 초안. level='위험'일 때만 채워지고 '주의'면 null.",
     )
+    next_steps: list[str] = Field(
+        default_factory=list,
+        examples=[["큰 기기를 동시에 켜지 않도록 사용 시간을 나눠보세요.",
+                   "건물에 여유 용량이 있는지 확인해 증설이 가능한지 알아보세요."]],
+        description="점주가 지금 할 수 있는 조치 2~3가지. '감지했다'로 끝내지 않고 "
+                    "'그래서 뭘 하면 되는지'까지 안내하기 위한 필드. 근거는 프롬프트에 "
+                    "넣어둔 참고 안내사항(한전 증설 제도 등)뿐이며 모델이 제도를 지어내지 못한다.",
+    )
+    inquiry_draft: str | None = Field(
+        default=None,
+        examples=["안녕하세요, 충북식당입니다. 최근 영업시간 외에 전기 사용량이 설비 용량을 "
+                  "넘는다는 안내를 받았습니다. 저희 매장이 증설 대상인지 확인 부탁드립니다."],
+        description="점주가 한전(고객센터 123 / cyber.kepco.co.kr)이나 전기공사 업체에 "
+                    "그대로 보낼 수 있는 문의 초안.",
+    )
     verification_passed: bool = Field(
         examples=[True],
         description="생성문에 입력에 없던 숫자가 섞였는지 자동 대조한 결과. false면 환각 의심 - "

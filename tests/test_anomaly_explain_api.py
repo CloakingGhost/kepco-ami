@@ -72,10 +72,26 @@ class TestVerifyNumbers:
         ("내부 온도가 78도까지 상승했습니다", ["78"]),
         ("관측 25.7kWh를 기록했습니다", ["25.7"]),
         ("예상 피해액 350만원", ["350"]),
+        # 대처방안이 생기면서 모델이 금액·기간을 지어낼 자리가 늘었다 - 특히 이쪽을 본다.
+        ("초과요금 47만원이 부과됩니다", ["47"]),
+        ("지난 5일간 9회 발생했습니다", ["5", "9"]),
     ])
     def test_fabricated_numbers_detected(self, allowed, text, expected):
         """입력 어디에도 없는 숫자는 반드시 잡아야 한다(이게 이 기능의 존재 이유)."""
         assert verify_numbers(text, allowed) == expected
+
+    @pytest.mark.parametrize("text", [
+        "한전 고객센터 123으로 문의하세요",
+        "24시간 매장은 720시간 특례를 신청할 수 있습니다",
+        "계약전력 20kW 이상이면 15분 단위로 확인합니다",
+    ])
+    def test_guidance_numbers_pass(self, allowed, text):
+        """
+        대처방안 근거로 프롬프트에 넣어준 참고 안내사항(OWNER_GUIDANCE)의 수치는
+        입력의 일부이므로 통과해야 한다. 이게 막히면 대처방안 문장이 통째로
+        '확인 필요'로 찍혀 검증 배지가 무의미해진다.
+        """
+        assert verify_numbers(text, allowed) == []
 
     def test_rounding_tolerance(self, allowed):
         """18.94857...을 18.95로 반올림해 써도 통과해야 한다(표기 흔들림 허용)."""
@@ -100,6 +116,15 @@ class TestPromptPayload:
     def test_rule_code_is_translated(self):
         """규칙 코드값이 아니라 근거 조문이 담긴 문장이 모델에 전달돼야 한다."""
         assert "KEC 212.3" in build_prompt_payload(DANGER_EVENT)["발동규칙"]
+
+    def test_guidance_is_included(self):
+        """
+        대처방안·문의초안의 근거(한전 증설 제도 등)가 프롬프트에 실려야 한다.
+        빠지면 모델이 제도를 스스로 지어내게 되고, 서술형 환각은 verify_numbers가
+        잡지 못한다.
+        """
+        guidance = build_prompt_payload(DANGER_EVENT)["참고_안내사항"]
+        assert "증설" in guidance and "123" in guidance
 
 
 # ============================================================

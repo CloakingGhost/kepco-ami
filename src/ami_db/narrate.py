@@ -40,6 +40,26 @@ PRIMARY_TIMEOUT_SEC = 10
 FALLBACK_TIMEOUT_SEC = 14
 CACHE_PATH = CACHE_DIR / "narration_cache.json"
 
+# 점주 안내에 쓸 수 있는 사실만 모아둔 참고 자료.
+#
+# 왜 프롬프트에 박아 넣는가: 모델이 제도·절차·비용을 스스로 알고 있다고 믿으면 안 된다.
+# 숫자 환각은 verify_numbers()가 잡지만 "이런 제도가 있습니다" 같은 서술형 환각은 기계가
+# 잡을 수 없어서, 애초에 근거 자료를 입력으로 주고 "여기 있는 것만 쓰라"고 못박는다.
+# 출처: 배달의민족 사장님센터(ceo.baemin.com/knowhow/11020),
+#       요기요 파트너(partner.yogiyo.co.kr, 음식점 전기요금·계약전력 계산방법),
+#       한국전력공사 고객센터 안내(www.kepco.co.kr).
+OWNER_GUIDANCE = """- 계약전력은 한전이 그 매장에 공급하기로 약속한 전력 용량이며, 매장 배선·차단기가
+  그 용량에 맞춰 설치되어 있다.
+- 계약전력을 넘겨 쓰는 일이 반복되면 한전에서 먼저 증설 안내문을 보내고, 그 뒤로도
+  반복되면 초과요금이 붙을 수 있다.
+- 증설은 두 가지다. 건물에 여유 용량이 남아 있으면 공사 없이 서류(건물주 날인,
+  임대차계약서)만으로 처리되고, 여유가 없으면 분전함 교체 같은 내선공사가 필요하다.
+- 24시간 운영하는 매장은 한전에 '720시간 특례'를 신청하면 기준시간이 늘어 초과 판정이
+  줄어들 수 있다.
+- 계약전력 20kW 이상인 매장은 한전도 15분 단위로 피크 전력을 확인한다. 전자레인지·
+  커피머신처럼 큰 기기를 동시에 켜면 순간 사용량이 치솟는다.
+- 문의처: 한국전력공사 고객센터(국번 없이 123, 24시간), 한전 사이버지점(cyber.kepco.co.kr)."""
+
 SYSTEM_PROMPT = """당신은 전기안전 관제 시스템의 보고서 작성 보조입니다.
 
 절대 규칙:
@@ -48,15 +68,33 @@ SYSTEM_PROMPT = """당신은 전기안전 관제 시스템의 보고서 작성 �
    감지하며, 실제 사고 발생 여부는 알 수 없습니다.
 3. 원인을 추정하지 마십시오. (예: "냉장고 고장으로 보입니다" 같은 표현 금지)
    관측된 사실만 기술하고, 점검을 권유하는 선에서 멈추십시오.
-4. 반드시 아래 JSON만 출력하십시오. 코드블록 표시나 설명을 덧붙이지 마십시오.
+4. 제도·절차·비용은 입력의 '참고_안내사항'에 있는 내용만 쓰십시오. 거기 없는 제도나
+   금액을 지어내지 마십시오.
+5. 반드시 아래 JSON만 출력하십시오. 코드블록 표시나 설명을 덧붙이지 마십시오.
 
-{"owner_sms": "...", "admin_note": "...", "emergency_report": null}
+{"owner_sms": "...", "admin_note": "...", "emergency_report": null,
+ "next_steps": ["...", "..."], "inquiry_draft": "..."}
 
-- owner_sms: 점주에게 보낼 문자. 2~3문장, 존댓말. 불안을 조장하지 말고 점검을 권유하되,
-  관측값과 임계값을 반드시 포함하십시오.
-- admin_note: 관리자용 점검 사유. 1~2문장. 발동한 규칙과 근거 수치를 명시하십시오.
+- owner_sms: 점주에게 보낼 문자. 2~3문장, 존댓말.
+  **전기를 잘 모르는 분이 읽는다고 가정하십시오.** 숫자와 전문용어 대신 무슨 일이
+  일어나고 있는지를 일상어로 쓰고, 겁을 주는 대신 무엇을 하면 되는지로 끝내십시오.
+  나쁜 예: "전력 사용량이 18.95kWh로 계약전력(45kW)의 130%를 초과했습니다."
+  좋은 예: "어젯밤 문을 닫으신 시간에, 매장 전기설비가 감당하도록 되어 있는 양보다
+  훨씬 많은 전기가 한 시간 넘게 계속 쓰였습니다. 누전이나 과열일 수 있어 전기 점검을
+  받아보시길 권해드립니다."
+- admin_note: 관리자·전기담당자용. 1~2문장. 여기는 반대로 전문용어를 그대로 쓰고,
+  발동한 규칙 이름과 근거 수치(관측값·임계값)를 정확히 명시하십시오.
 - emergency_report: 안전등급이 '위험'일 때만 신고 접수용 3~4문장으로 작성하고,
-  '주의'이면 반드시 null로 두십시오."""
+  '주의'이면 반드시 null로 두십시오.
+- next_steps: 점주가 지금 할 수 있는 일 2~3가지. **각 항목은 "무엇을 왜"가 드러나는
+  완결된 한 문장**으로 쓰십시오("전기 점검 요청"처럼 명사로 끊지 마십시오).
+  '참고_안내사항'에 근거한 것만 쓰고, 매장 상황에 맞는 것만 고르십시오.
+  예: "냉장고·에어컨처럼 큰 기기가 동시에 돌지 않도록 시간을 나눠 쓰시면 순간 사용량을
+  낮출 수 있습니다." / "건물에 여유 용량이 남아 있으면 공사 없이 서류만으로 용량을 늘릴
+  수 있으니, 한전 고객센터(123)에 증설 대상인지 문의해 보세요."
+- inquiry_draft: 점주가 한전이나 전기공사 업체에 그대로 보낼 수 있는 문의 초안.
+  3~4문장. 매장명과 관측된 상황을 포함하되, 용어는 쉽게 쓰고 무엇을 알고 싶은지를
+  분명히 하십시오(예: 우리 매장이 증설 대상인지, 공사가 필요한지)."""
 
 
 # rule_triggered -> 프롬프트에 넣을 한국어 규칙 설명. 코드값을 그대로 주면 모델이
@@ -110,6 +148,9 @@ def build_prompt_payload(event: dict) -> dict:
         "관측_전력량_kWh_15분": round(metric, 2) if metric is not None else None,
         "임계_전력량_kWh_15분": round(threshold, 2) if threshold is not None else None,
         "판정_범위": "영업시간 외(비영업시간)",
+        # 대처방안(next_steps)·문의초안(inquiry_draft)의 근거. 모델이 제도를 스스로
+        # 안다고 믿지 않고 사실을 통째로 넣어준다 - OWNER_GUIDANCE 주석 참고.
+        "참고_안내사항": OWNER_GUIDANCE,
     }
     if event.get("repeat_count"):
         payload["최근24시간_반복횟수"] = event["repeat_count"]
@@ -124,6 +165,10 @@ class NarrationResult:
     model: str
     elapsed_ms: int
     verification_passed: bool
+    # 점주가 "그래서 뭘 어쩌라는 거지?"에 답하는 부분. 기본값을 둬서 이 필드가 없던
+    # 시절에 저장된 캐시 항목(NarrationResult(**cached))도 그대로 읽힌다.
+    next_steps: list[str] = field(default_factory=list)
+    inquiry_draft: str | None = None
     unknown_numbers: list[str] = field(default_factory=list)
     raw_output: str = ""
     # "live"=이번에 생성, "cache"=이전 생성분 재사용(LLM API 장애 시). 화면·응답에 그대로
@@ -150,6 +195,8 @@ def _save_cache(key: str, result: "NarrationResult") -> None:
         "owner_sms": result.owner_sms,
         "admin_note": result.admin_note,
         "emergency_report": result.emergency_report,
+        "next_steps": result.next_steps,
+        "inquiry_draft": result.inquiry_draft,
         "model": result.model,
         "elapsed_ms": result.elapsed_ms,
         "verification_passed": result.verification_passed,
@@ -221,6 +268,13 @@ def build_allowed_numbers(event: dict) -> set[float]:
         if v is not None:
             allowed.add(v)
 
+    # 참고 안내사항에 든 수치(고객센터 123, 720시간 특례, 20kW 기준 등)도 입력의 일부이므로
+    # 허용한다. 이걸 빼면 대처방안 문장이 통째로 "확인 필요"로 찍혀 검증이 무의미해진다.
+    for token in _number_tokens(OWNER_GUIDANCE):
+        v = _norm(token)
+        if v is not None:
+            allowed.add(v)
+
     # 관측/임계에서 자연스럽게 파생되는 표현(초과분, 배수)도 허용한다 - 모델이
     # "임계보다 4.32kWh 높다"처럼 쓰는 것은 지어낸 값이 아니라 계산된 값이다.
     metric, threshold = _as_float(event.get("metric_value")), _as_float(event.get("threshold_value"))
@@ -281,7 +335,9 @@ def _call_llm(event: dict, model: str, timeout: int = PRIMARY_TIMEOUT_SEC) -> tu
             },
         ],
         "temperature": 0.2,
-        "max_tokens": 700,
+        # 필드가 5개(문자·점검사유·신고초안·대처방안·문의초안)로 늘었고 한국어는 토큰을
+        # 많이 먹어서 700으로는 뒷쪽 필드가 통째로 누락됐다(실측). 넉넉히 잡는다.
+        "max_tokens": 1400,
     }).encode("utf-8")
     started = time.time()
     try:
@@ -307,14 +363,29 @@ def _narrate_with_model(event: dict, model: str, timeout: int) -> NarrationResul
     if not owner_sms or not admin_note:
         raise ValueError(f"필수 필드가 비어 있습니다: {raw[:200]}")
 
+    # 리스트가 아니라 문자열 하나로 오는 경우가 있어 형태를 맞춰준다.
+    raw_steps = parsed.get("next_steps") or []
+    if isinstance(raw_steps, str):
+        raw_steps = [raw_steps]
+    next_steps = [str(s).strip() for s in raw_steps if str(s).strip()]
+
+    inquiry = parsed.get("inquiry_draft")
+    inquiry_draft = str(inquiry).strip() if inquiry else None
+
+    # 검증 대상에 대처방안·문의초안도 포함한다 - 오히려 이쪽이 제도·금액을 지어내기
+    # 쉬운 자리라 반드시 같이 본다.
     allowed = build_allowed_numbers(event)
     unknown = verify_numbers(
-        " ".join(filter(None, [owner_sms, admin_note, emergency_report])), allowed
+        " ".join(filter(None, [owner_sms, admin_note, emergency_report,
+                               " ".join(next_steps), inquiry_draft])),
+        allowed,
     )
     return NarrationResult(
         owner_sms=owner_sms,
         admin_note=admin_note,
         emergency_report=emergency_report,
+        next_steps=next_steps,
+        inquiry_draft=inquiry_draft,
         model=model,
         elapsed_ms=elapsed_ms,
         verification_passed=not unknown,

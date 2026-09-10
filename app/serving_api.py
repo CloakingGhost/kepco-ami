@@ -412,6 +412,8 @@ def explain_anomaly(body: AnomalyExplainRequest):
         "owner_sms": result.owner_sms,
         "admin_note": result.admin_note,
         "emergency_report": result.emergency_report,
+        "next_steps": result.next_steps,
+        "inquiry_draft": result.inquiry_draft,
         "verification_passed": result.verification_passed,
         "unknown_numbers": result.unknown_numbers,
         "model": result.model,
