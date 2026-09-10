@@ -99,6 +99,34 @@ class TestVerifyNumbers:
         # 다만 허용 오차(0.5%)를 벗어나면 잡힌다
         assert verify_numbers("관측값은 19.5kWh입니다", allowed) == ["19.5"]
 
+    def test_small_threshold_quoted_exactly_passes(self):
+        """
+        작은 임계값을 **정확히 인용한** 문장이 환각으로 찍히면 안 된다.
+
+        프롬프트에는 round(x, 2)로 넣으므로 모델이 그대로 받아 적으면 원본과 최대
+        0.005 벌어진다. 비율 오차(0.5%)만 쓰던 시절 0.4649 -> "0.46"이 0.0049 차이로
+        걸려서, 임계값을 제대로 인용한 설명이 화면에서 통째로 사라졌다(실측 2026-09-10).
+        """
+        event = {
+            **DANGER_EVENT,
+            "rule_triggered": "empty_store_baseline_3x_60min",
+            "metric_value": 0.9412,
+            "threshold_value": 0.4649,
+        }
+        text = "관측 0.94 kWh/15분이 임계 0.46 kWh/15분을 초과했습니다"
+        assert verify_numbers(text, build_allowed_numbers(event)) == []
+
+    def test_minutes_expressed_as_hours_passes(self, allowed):
+        """
+        규칙 문구는 "60분 지속"인데 점주용 문장은 "1시간"으로 쓰는 게 자연스럽다.
+        단위를 바꿔 적은 것이므로 환각이 아니다.
+        """
+        assert verify_numbers("1시간 넘게 계속 쓰였습니다", allowed) == []
+
+    def test_widened_tolerance_still_catches_fabrication(self, allowed):
+        """허용 범위를 넓힌 뒤에도 지어낸 값은 그대로 걸려야 한다(넓히기의 안전장치)."""
+        assert verify_numbers("내부 온도 78도, 피해액 350만원", allowed) == ["78", "350"]
+
 
 class TestPromptPayload:
     def test_datetime_and_decimal_are_serializable(self):

@@ -35,14 +35,21 @@ class Settings(BaseSettings):
     # 예비 키. 1순위 키가 rate limit(429)이나 인증 거부(401/403)를 맞으면 이 키로 한 번 더
     # 시도한다 - 무료 티어에서 데모 중 호출이 몰리면 429가 나기 쉽다.
     nvidia_api_key_2nd: str = ""
-    # 모델 선정 근거: 13종을 실측 비교한 결과 mistral-nemotron이 2.8초/한국어 JSON 정상으로
-    # 가장 빨랐다(차선 google/gemma-4-31b-it 12.8초). 13종 중 9종은 /v1/models 목록에는
-    # 있으나 실제 추론이 404/503이었다. 전체 기록은 docs/LLM_모델선정_비교실험.md,
-    # 재현은 scripts/18_probe_llm_models.py.
-    nvidia_model: str = "mistralai/mistral-nemotron"
-    # 1순위 모델이 죽었을 때 쓸 대체 모델. 실측 중 mistral-nemotron이 2.8초 -> 60초
-    # 타임아웃으로 갑자기 응답 불능이 된 반면 gemma는 계속 살아 있었다(같은 시각 14.5초).
-    # 호스팅 모델은 이렇게 예고 없이 흔들리므로 폴백을 기본값으로 둔다.
+    # 모델 선정 근거: docs/LLM_모델선정_비교실험.md, 재현은 scripts/18_probe_llm_models.py.
+    #
+    # 2026-09-10 재점검 - 원래 1순위였던 mistralai/mistral-nemotron을 **버렸다.**
+    # 목록(/v1/models)에는 그대로 있지만 실제 추론이 120초를 넘겨도 응답하지 않고
+    # 예비 키로는 HTTP 500이 온다. 429도 rate-limit 헤더도 없으니 우리 호출 한도가 아니라
+    # 호스팅 쪽이 죽은 것이다. 이걸 1순위로 두면 매 요청이 그 모델을 기다리다 버려진다.
+    #
+    # 같은 날 같은 프롬프트로 살아 있던 모델(응답시간/한국어 JSON):
+    #   nvidia/nemotron-3-super-120b-a12b  23.6s / 28.8s / 47.9s  정상
+    #   openai/gpt-oss-20b                 41.9s                  정상
+    #   google/gemma-4-31b-it              57.1s                  정상(문장 품질 가장 안정적)
+    # 나머지 후보는 404(목록에는 있으나 추론 불가)였다.
+    nvidia_model: str = "nvidia/nemotron-3-super-120b-a12b"
+    # 1순위가 404로 즉사하면 남은 예산을 이 모델이 쓴다. gemma는 가장 느리지만 세 번의
+    # 재점검에서 출력 품질이 가장 일관됐다(nemotron-3-super는 next_steps가 비는 경우가 있었다).
     nvidia_model_fallback: str = "google/gemma-4-31b-it"
 
     # 파일럿 범위 고정값. 근거는 .env.example 주석 참고

@@ -89,7 +89,7 @@ def check_api_key(state: PipelineState) -> PipelineState:
 
 def build_payload(state: PipelineState) -> PipelineState:
     narrate.build_prompt_payload(state["event"])  # 실제 변환 로직 실행(검증 목적)
-    return {"model": settings.nvidia_model, "timeout": narrate.PRIMARY_TIMEOUT_SEC,
+    return {"model": settings.nvidia_model, "timeout": narrate.PER_MODEL_TIMEOUT_SEC,
             "attempt_label": "primary"}
 
 
@@ -110,7 +110,7 @@ def call_primary(state: PipelineState) -> PipelineState:
 def call_fallback(state: PipelineState) -> PipelineState:
     return _call_model_node({
         **state, "model": settings.nvidia_model_fallback,
-        "timeout": narrate.FALLBACK_TIMEOUT_SEC, "attempt_label": "fallback",
+        "timeout": narrate.PER_MODEL_TIMEOUT_SEC, "attempt_label": "fallback",
     })
 
 

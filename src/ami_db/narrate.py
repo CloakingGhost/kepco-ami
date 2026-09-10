@@ -31,13 +31,19 @@ from .config import CACHE_DIR, GENERATED_DIR, settings
 
 API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 # 타임아웃 상한은 **앞단 프록시가 정한다**. 실측(2026-09-10): 서버 nginx가 60초,
-# Next.js dev 프록시가 30초에서 연결을 끊는다. 그래서 1순위(10초) + 대체(14초) +
-# 오버헤드가 30초 안에 들어오도록 잡았다 - 이걸 넘기면 사용자는 응답 대신 502/504를 본다.
+# Next.js 프록시가 30초에서 연결을 끊는다. 이걸 넘기면 사용자는 응답 대신 502/504를 본다.
 #
-# 성공 사례는 3.8~11초 구간에 몰려 있어(docs/LLM_설명API_검증결과.md) 10초로 끊어도
-# 대부분 잡힌다. 둘 다 실패하면 캐시로 즉시 응답하므로 최악의 경우에도 24초 안에 끝난다.
-PRIMARY_TIMEOUT_SEC = 10
-FALLBACK_TIMEOUT_SEC = 14
+# 예산을 모델별로 따로 주지 않고 **전체 한도(LIVE_BUDGET_SEC)를 나눠 쓴다.** 예전엔
+# 1순위 10초 + 대체 14초로 각각 고정했는데, 1순위가 404로 0.2초 만에 죽는 날에도 대체
+# 모델은 여전히 14초만 쓸 수 있어 남은 시간을 버렸다. 반대로 1순위가 끝까지 물고 늘어지면
+# 대체까지 시도하다 프록시 한도를 넘겼다. 남은 시간을 계산해서 넘기면 두 경우 다 풀린다.
+LIVE_BUDGET_SEC = 27       # 프록시 30초에서 응답 직렬화/네트워크 몫을 뺀 값
+PER_MODEL_TIMEOUT_SEC = 22  # 한 모델이 예산을 전부 삼키지 않도록 하는 상한
+MIN_ATTEMPT_SEC = 4         # 이보다 적게 남았으면 시도해봐야 의미가 없다
+
+# 2026-09-10 현재 살아 있는 모델은 전부 24~57초라 **라이브 호출은 이 예산 안에 못 들어오는
+# 날이 더 많다.** 그래서 시연 신뢰성은 캐시가 담보한다(scripts/20_warm_narration_cache.py로
+# 미리 채운다). 라이브는 캐시에 없는 이벤트를 위한 보조 경로로 남겨둔다.
 # 캐시를 두 곳으로 나눈다.
 #   SEED_PATH: git에 커밋된 읽기 전용 시드. 새로 배포한 서버에도 데모용 설명이 처음부터
 #              들어 있게 한다.
@@ -245,6 +251,14 @@ def _norm(token: str) -> float | None:
         return None
 
 
+# 프롬프트에 넣는 수치는 build_prompt_payload가 소수 둘째 자리로 반올림한다. 그래서 모델이
+# 그대로 받아 적은 값도 원본과 최대 0.005만큼 벌어질 수 있다(0.4649 -> "0.46").
+# 비율 오차(0.5%)만 쓰면 작은 값에서 이 폭을 못 덮는다 - 0.46의 0.5%는 0.0023뿐이라
+# **임계값을 정확히 인용한 문장이 환각으로 찍혔다**(실측: 0.46 / 0.66). 화면은 검증에
+# 실패한 설명을 숨기므로, 이 오탐은 멀쩡한 설명을 조용히 지워버린다.
+ROUNDING_TOLERANCE = 0.005
+
+
 def verify_numbers(text: str, allowed: set[float]) -> list[str]:
     """
     생성문에 입력에 없던 숫자가 섞였는지 검사해 그 목록을 돌려준다(빈 리스트 = 통과).
@@ -260,8 +274,11 @@ def verify_numbers(text: str, allowed: set[float]) -> list[str]:
         value = _norm(token)
         if value is None:
             continue
-        # 표기 반올림 흔들림 허용: 허용값 중 하나와 0.5% 이내면 같은 값으로 본다.
-        if any(abs(value - a) <= max(abs(a) * 0.005, 1e-9) for a in allowed):
+        # 표기 반올림 흔들림 허용: 허용값 중 하나와 0.5% 또는 0.005(둘 중 큰 쪽) 이내면
+        # 같은 값으로 본다. 큰 값은 비율이, 작은 값은 절대 오차가 지배한다.
+        if any(
+            abs(value - a) <= max(abs(a) * 0.005, ROUNDING_TOLERANCE) for a in allowed
+        ):
             continue
         unknown.append(token)
     return unknown
@@ -276,7 +293,13 @@ def build_allowed_numbers(event: dict) -> set[float]:
     for key in ("contract_power_kw", "metric_value", "threshold_value", "repeat_count"):
         v = event.get(key)
         if v is not None:
-            allowed.add(float(v))
+            value = float(v)
+            allowed.add(value)
+            # **모델에게 실제로 준 형태**도 함께 허용한다. build_prompt_payload가 소수
+            # 둘째 자리로 반올림해서 넘기므로, 모델이 정확히 받아 적으면 원본이 아니라
+            # 이 값이 문장에 나온다. 원본만 허용 집합에 넣으면 그 인용이 환각으로 찍힌다.
+            allowed.add(round(value, 2))
+            allowed.add(round(value, 1))
 
     # 규칙이 스스로 명시하는 수치(130% / 60분 / 212.3 등)는 규칙 설명문에서 그대로 뽑아 허용한다.
     rule_text = event.get("rule_text") or RULE_DESCRIPTIONS.get(event.get("rule_triggered", ""), "")
@@ -284,6 +307,12 @@ def build_allowed_numbers(event: dict) -> set[float]:
         v = _norm(token)
         if v is not None:
             allowed.add(v)
+
+    # 지속시간의 분<->시간 환산도 허용한다. 규칙 문구는 "60분 지속"이라고 적지만 점주가
+    # 읽을 문장은 "한 시간 넘게"/"1시간 이상"으로 쓰는 게 자연스럽고, 실제로 그렇게 나온다.
+    # 단위를 바꿔 적은 것을 환각으로 세면 멀쩡한 문장이 화면에서 사라진다(실측: '1').
+    for minutes in re.findall(r"(\d+)\s*분", rule_text):
+        allowed.add(int(minutes) / 60)
 
     # 감지 시각 구성요소(연/월/일/시/분)
     for token in _number_tokens(str(event.get("detected_at", ""))):
@@ -347,7 +376,7 @@ def _post(body: bytes, api_key: str, timeout: int) -> dict:
         return json.load(response)
 
 
-def _call_llm(event: dict, model: str, timeout: int = PRIMARY_TIMEOUT_SEC) -> tuple[str, int]:
+def _call_llm(event: dict, model: str, timeout: int = PER_MODEL_TIMEOUT_SEC) -> tuple[str, int]:
     body = json.dumps({
         "model": model,
         "messages": [
@@ -359,8 +388,11 @@ def _call_llm(event: dict, model: str, timeout: int = PRIMARY_TIMEOUT_SEC) -> tu
         ],
         "temperature": 0.2,
         # 필드가 5개(문자·점검사유·신고초안·대처방안·문의초안)로 늘었고 한국어는 토큰을
-        # 많이 먹어서 700으로는 뒷쪽 필드가 통째로 누락됐다(실측). 넉넉히 잡는다.
-        "max_tokens": 1400,
+        # 많이 먹는다. 700 -> 1400으로 한 번 올렸는데도 부족했다: 2026-09-10 실측에서
+        # nemotron-3-super가 1685~1744 토큰, gpt-oss-20b가 1367 토큰을 썼다. 1400에서
+        # 잘리면 JSON이 중간에 끊겨 **파싱 자체가 실패**하고, 그게 "모델이 응답을 안 한다"로
+        # 오인됐다. 실측 최대치의 1.4배로 잡는다.
+        "max_tokens": 2400,
     }).encode("utf-8")
     started = time.time()
     try:
@@ -444,12 +476,22 @@ def narrate_event(
 
     candidates = [model] if model else [settings.nvidia_model, settings.nvidia_model_fallback]
     errors: list[str] = []
-    for position, candidate in enumerate([c for c in candidates if c]):
-        timeout = PRIMARY_TIMEOUT_SEC if position == 0 else FALLBACK_TIMEOUT_SEC
+    deadline = time.time() + LIVE_BUDGET_SEC
+    for candidate in [c for c in candidates if c]:
+        remaining = deadline - time.time()
+        if remaining < MIN_ATTEMPT_SEC:
+            errors.append(f"{candidate}: 예산소진({remaining:.1f}s 남음)")
+            break
         try:
-            result = _narrate_with_model(event, candidate, timeout)
+            result = _narrate_with_model(
+                event, candidate, int(min(PER_MODEL_TIMEOUT_SEC, remaining))
+            )
         except Exception as e:  # noqa: BLE001 - 어떤 실패든 다음 후보로 넘어간다
-            errors.append(f"{candidate}: {type(e).__name__}")
+            # 예외 타입만 남기면 "왜 실패했는지"를 로그에서 알 수 없어 원인 추적이 막힌다
+            # (실제로 502의 원인이 모델 사망인지 파싱 실패인지 구분하는 데 시간을 썼다).
+            # 메시지도 함께 남기되 혹시 섞여 들어올 수 있는 키 문자열은 지운다.
+            detail = re.sub(r"nvapi-[A-Za-z0-9_\-]+", "***", str(e))[:120]
+            errors.append(f"{candidate}: {type(e).__name__}({detail})")
             continue
         _save_cache(_cache_key(event), result)
         return result
