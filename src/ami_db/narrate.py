@@ -27,7 +27,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from .config import CACHE_DIR, settings
+from .config import CACHE_DIR, GENERATED_DIR, settings
 
 API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 # 타임아웃 상한은 **앞단 프록시가 정한다**. 실측(2026-09-10): 서버 nginx가 60초,
@@ -38,7 +38,15 @@ API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 # 대부분 잡힌다. 둘 다 실패하면 캐시로 즉시 응답하므로 최악의 경우에도 24초 안에 끝난다.
 PRIMARY_TIMEOUT_SEC = 10
 FALLBACK_TIMEOUT_SEC = 14
-CACHE_PATH = CACHE_DIR / "narration_cache.json"
+# 캐시를 두 곳으로 나눈다.
+#   SEED_PATH: git에 커밋된 읽기 전용 시드. 새로 배포한 서버에도 데모용 설명이 처음부터
+#              들어 있게 한다.
+#   CACHE_PATH: 런타임이 실제로 쓰는 파일. output/generated는 이미 gitignore라 서버에서
+#              파일이 변경돼도 git pull과 충돌하지 않는다.
+# 처음엔 시드 파일 하나에 런타임 쓰기까지 했다가, 배포 때마다 "local changes would be
+# overwritten by merge"로 git pull이 막히는 것을 실측하고 분리했다.
+SEED_PATH = CACHE_DIR / "narration_cache.json"
+CACHE_PATH = GENERATED_DIR / "narration_cache.json"
 
 # 점주 안내에 쓸 수 있는 사실만 모아둔 참고 자료.
 #
@@ -180,17 +188,23 @@ def _cache_key(event: dict) -> str:
     return f"{event.get('store_id')}:{_fmt_ts(event.get('detected_at'))}"
 
 
-def _load_cache() -> dict:
-    if not CACHE_PATH.exists():
+def _read_json(path) -> dict:
+    if not path.exists():
         return {}
     try:
-        return json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return {}
 
 
+def _load_cache() -> dict:
+    """시드(커밋본) 위에 런타임 캐시를 덮어쓴 결과. 런타임에 새로 만든 게 항상 우선한다."""
+    return {**_read_json(SEED_PATH), **_read_json(CACHE_PATH)}
+
+
 def _save_cache(key: str, result: "NarrationResult") -> None:
-    cache = _load_cache()
+    """런타임 캐시에만 쓴다(시드는 커밋본이라 건드리지 않는다)."""
+    cache = _read_json(CACHE_PATH)
     cache[key] = {
         "owner_sms": result.owner_sms,
         "admin_note": result.admin_note,

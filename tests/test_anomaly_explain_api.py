@@ -164,6 +164,8 @@ class TestPreferCache:
             '"verification_passed":true,"unknown_numbers":[]}}',
             encoding="utf-8",
         )
+        # 시드(커밋된 데모 캐시)까지 같이 치워야 이 테스트가 의도한 상태가 된다.
+        monkeypatch.setattr(narrate, "SEED_PATH", tmp_path / "no_seed.json")
         monkeypatch.setattr(narrate, "CACHE_PATH", cache_file)
         monkeypatch.setattr(narrate, "_call_llm", _should_not_be_called)
 
@@ -176,6 +178,7 @@ class TestPreferCache:
         """캐시에 없으면 prefer_cache여도 평소대로 LLM을 시도해야 한다."""
         import ami_db.narrate as narrate
 
+        monkeypatch.setattr(narrate, "SEED_PATH", tmp_path / "no_seed.json")
         monkeypatch.setattr(narrate, "CACHE_PATH", tmp_path / "empty.json")
         monkeypatch.setattr(
             narrate, "_call_llm",
