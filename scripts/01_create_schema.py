@@ -70,6 +70,47 @@ def migrate_anomaly_level_check(cur) -> None:
     print(f"  ADD CONSTRAINT {ANOMALY_LEVEL_CONSTRAINT} (level IN {ANOMALY_LEVEL_VALUES})")
 
 
+ANOMALY_SLOT_UNIQUE = "anomaly_events_meter_detected_uniq"
+
+
+def migrate_anomaly_slot_unique(cur) -> None:
+    """
+    anomaly_events에 UNIQUE(meter_id, detected_at) 추가.
+
+    전체 재계산 배치(10_detect_anomalies.py)는 DELETE 후 INSERT라 중복이 안 생겼지만,
+    증분 배치(21_detect_anomalies_incremental.py)는 같은 슬롯을 여러 번 볼 수밖에 없다
+    (지속 조건 판정에 최대 3시간 lookback이 필요해 창이 겹친다). 이 제약이 있어야
+    ON CONFLICT DO NOTHING으로 "이미 감지된 슬롯은 조용히 건너뛰기"가 성립한다.
+
+    실측 확인: 추가 시점의 기존 데이터에 (meter_id, detected_at) 중복은 0건이었다.
+    """
+    cur.execute(
+        """
+        SELECT 1 FROM pg_constraint con
+        JOIN pg_class rel ON rel.oid = con.conrelid
+        WHERE rel.relname = 'anomaly_events' AND con.conname = %s
+        """,
+        (ANOMALY_SLOT_UNIQUE,),
+    )
+    if cur.fetchone():
+        return  # 이미 적용됨
+
+    cur.execute(
+        "SELECT count(*) FROM (SELECT meter_id, detected_at FROM anomaly_events "
+        "GROUP BY 1, 2 HAVING count(*) > 1) dup"
+    )
+    dup_count = cur.fetchone()[0]
+    if dup_count:
+        print(f"  ⚠ 중복 {dup_count}건이 있어 UNIQUE 제약을 건너뜁니다 - 먼저 정리하세요")
+        return
+
+    cur.execute(
+        f"ALTER TABLE anomaly_events ADD CONSTRAINT {ANOMALY_SLOT_UNIQUE} "
+        f"UNIQUE (meter_id, detected_at)"
+    )
+    print(f"  ADD CONSTRAINT {ANOMALY_SLOT_UNIQUE} UNIQUE (meter_id, detected_at)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--reset", action="store_true", help="기존 테이블을 CASCADE로 지우고 재생성")
@@ -89,6 +130,9 @@ def main() -> None:
 
             print("마이그레이션: anomaly_events.level 3단계 CHECK...")
             migrate_anomaly_level_check(cur)
+
+            print("마이그레이션: anomaly_events 슬롯 UNIQUE(증분 배치 멱등성)...")
+            migrate_anomaly_slot_unique(cur)
 
     print("완료: 7개 테이블 생성됨.")
 

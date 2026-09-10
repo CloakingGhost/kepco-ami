@@ -323,6 +323,44 @@ class AnomalySnapshotResponse(BaseModel):
     )
 
 
+class AnomalyEpisode(BaseModel):
+    start_at: datetime
+    end_at: datetime
+    slot_count: int = Field(examples=[4], description="이 사건에 속한 15분 슬롯 수")
+    duration_min: int = Field(examples=[60], description="slot_count x 15분")
+    level: str = Field(examples=["주의"], description="'주의' | '위험'")
+    rule_triggered: str = Field(examples=["empty_store_baseline_3x_60min"])
+    max_metric_value: float = Field(description="사건 구간 중 가장 높았던 관측값(kWh, 15분)")
+    threshold_value: float = Field(description="그 규칙의 임계치(kWh, 15분)")
+
+
+class AnomalyPeriodStore(BaseModel):
+    store_id: int = Field(examples=[5])
+    store_name: str | None = Field(default=None, examples=["유림다방"])
+    meter_id: str = Field(examples=["A-L-30"])
+    event_count: int = Field(examples=[12], description="기간 내 슬롯 단위 이벤트 수")
+    danger_count: int = Field(examples=[0])
+    caution_count: int = Field(examples=[12])
+    episode_count: int = Field(examples=[3], description="연속 슬롯을 하나로 묶은 사건 수")
+    latest_level: str = Field(examples=["주의"])
+    latest_detected_at: datetime
+    episodes: list[AnomalyEpisode] = Field(description="시간순 사건 목록")
+
+
+class AnomalyPeriodResponse(BaseModel):
+    date: str = Field(examples=["26-05-13"], description="조회 기준 날짜(입력값 또는 서버 현재)")
+    time: str = Field(examples=["16:00"])
+    from_ts: datetime = Field(examples=["2026-05-01T00:00:00"], description="그 달 1일 00:00")
+    to_ts: datetime = Field(examples=["2026-05-13T16:00:00"], description="조회 기준 시점")
+    store_count: int = Field(examples=[4], description="기간 내 이벤트가 있었던 매장 수")
+    total_events: int = Field(examples=[43])
+    danger_count: int = Field(examples=[0])
+    caution_count: int = Field(examples=[43])
+    stores: list[AnomalyPeriodStore] = Field(
+        description="매장별 누적 결과. 위험이 있는 매장이 먼저, 그다음 건수가 많은 순.",
+    )
+
+
 class AnomalyExplainRequest(BaseModel):
     store_id: int = Field(examples=[12], description="상가 ID (1~21). body로 받는 이유는 URL에 store_id를 노출하지 않기 위함")
     detected_at: datetime = Field(

@@ -36,6 +36,7 @@ from ami_db.serving import (  # noqa: E402
     get_all_stores,
     get_anomalies,
     get_anomaly_event,
+    get_anomaly_period,
     get_anomaly_snapshot,
     get_current_status_all,
     get_current_status_one,
@@ -52,6 +53,7 @@ from app.schemas import (  # noqa: E402
     AnomalyExplainRequest,
     AnomalyExplainResponse,
     AnomalyListResponse,
+    AnomalyPeriodResponse,
     AnomalySnapshotResponse,
     CurrentStatusListResponse,
     CurrentStatusOneSchema,
@@ -361,6 +363,52 @@ def anomalies_snapshot(
     """
     try:
         return get_anomaly_snapshot(_engine, date, time)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get(
+    "/api/anomalies/period", tags=["안전감지"], summary="그 달 1일부터 지정 시점까지 누적 조회",
+    response_model=AnomalyPeriodResponse,
+)
+def anomalies_period(
+    date: str | None = Query(
+        default=None,
+        description=f"조회 기준 날짜 'YY-MM-DD'. 범위: "
+                    f"{EARLIEST_SAMPLE_DATE.strftime('%y-%m-%d')} ~ "
+                    f"{LATEST_SERVICE_DATE.strftime('%y-%m-%d')}. 생략하면 서버 현재 날짜.",
+        openapi_examples={
+            "5월 중순": {"summary": "실측 구간 - 05-01 00:00~05-13 16:00", "value": "26-05-13"},
+            "7월 데모": {"summary": "합성 구간 - 07-01 00:00~07-22 06:00", "value": "26-07-22"},
+            "현재": {"summary": "생략(서버 현재 기준)", "value": None},
+        },
+    ),
+    time: str | None = Query(
+        default=None,
+        description="조회 기준 시각 'HH:MM'(15분 단위). 생략하면 서버 현재 시:분.",
+        openapi_examples={
+            "오후 4시": {"summary": "16:00", "value": "16:00"},
+            "현재": {"summary": "생략", "value": None},
+        },
+    ),
+):
+    """
+    **그 달 1일 00:00부터 요청한 시점까지**의 안전감지 이력을 매장별로 묶어서 돌려준다.
+
+    스냅샷(`/api/anomalies/snapshot`)은 "지금 이 15분 슬롯"만 보기 때문에 사건이 없는
+    시각을 고르면 늘 비어 있다. 이 엔드포인트는 누적 구간을 보므로 "이번 달에 어느
+    매장에 무슨 일이 있었는지"를 한 번에 확인할 수 있다.
+
+    예: `?date=26-05-13&time=16:00` -> **2026-05-01 00:00 ~ 2026-05-13 16:00** 구간
+
+    **사건(episode) 단위로 묶어서 준다.** `anomaly_events`는 15분 슬롯당 1행이라 60분짜리
+    사건 하나가 4행으로 남는데, 그대로 내려보내면 화면에서 같은 사건이 네 번 반복되는
+    것처럼 보인다. 슬롯 간격이 15분을 넘거나 등급·규칙이 바뀌면 다른 사건으로 끊는다.
+
+    매장 정렬은 **위험이 있는 매장 먼저, 그다음 건수 많은 순**이라 앞에서부터 그리면 된다.
+    """
+    try:
+        return get_anomaly_period(_engine, date, time)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

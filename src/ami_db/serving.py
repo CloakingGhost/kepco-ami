@@ -761,6 +761,107 @@ def get_anomaly_snapshot(engine: Engine, date_str: str | None, time_str: str | N
     }
 
 
+def get_anomaly_period(engine: Engine, date_str: str | None, time_str: str | None) -> dict:
+    """
+    그 달 1일 00:00부터 지정 시점까지의 안전감지 이력을 매장별로 묶어서 돌려준다.
+
+    스냅샷(get_anomaly_snapshot)은 "지금 이 슬롯"만 보기 때문에, 사건이 없는 시각을
+    고르면 화면이 늘 비어 있다. 실제로는 한 달 동안 어느 매장에 무슨 일이 있었는지가
+    필요하므로 누적 조회를 따로 둔다(예: 26-05-13 16:00 -> 05-01 00:00~05-13 16:00).
+
+    슬롯 원시 행을 그대로 주지 않고 **사건(episode) 단위로 묶어서** 준다 - anomaly_events는
+    15분 슬롯당 1행이라 60분짜리 사건 하나가 4행으로 남고(판정기준 문서 8절 한계 2),
+    그대로 내려보내면 화면에서 같은 사건이 네 번 반복되는 것처럼 보인다. 끊는 기준은
+    슬롯 간격이 EPISODE_GAP_MINUTES를 넘거나, 등급/규칙이 바뀌는 지점이다.
+    """
+    now = service_now()
+    target_date = parse_service_date(date_str) if date_str else now.date()
+    target_time = parse_snapshot_time(time_str) if time_str else now.time()
+    end_ts = datetime.combine(target_date, target_time)
+    start_ts = datetime.combine(target_date.replace(day=1), time(0, 0))
+
+    query = text(
+        """
+        SELECT s.store_id, s.name AS store_name, ae.meter_id, ae.detected_at, ae.level,
+               ae.rule_triggered, ae.metric_value, ae.threshold_value
+        FROM anomaly_events ae
+        JOIN stores s ON s.meter_id = ae.meter_id
+        WHERE ae.detected_at >= :start_ts AND ae.detected_at <= :end_ts
+        ORDER BY s.store_id, ae.detected_at
+        """
+    )
+    with engine.connect() as conn:
+        df = pd.read_sql(query, conn, params={"start_ts": start_ts, "end_ts": end_ts})
+
+    gap = timedelta(minutes=EPISODE_GAP_MINUTES)
+    stores: list[dict] = []
+
+    for store_id, group in df.groupby("store_id", sort=True) if not df.empty else []:
+        rows = group.sort_values("detected_at").to_dict("records")
+        episodes: list[dict] = []
+        current: list[dict] = []
+
+        def _flush(bucket: list[dict]) -> None:
+            if not bucket:
+                return
+            metrics = [float(r["metric_value"]) for r in bucket]
+            episodes.append({
+                "start_at": bucket[0]["detected_at"],
+                "end_at": bucket[-1]["detected_at"],
+                "slot_count": len(bucket),
+                "duration_min": len(bucket) * 15,
+                "level": bucket[0]["level"],
+                "rule_triggered": bucket[0]["rule_triggered"],
+                "max_metric_value": max(metrics),
+                "threshold_value": float(bucket[0]["threshold_value"]),
+            })
+
+        for row in rows:
+            if current:
+                prev = current[-1]
+                broken = (
+                    row["detected_at"] - prev["detected_at"] > gap
+                    or row["level"] != prev["level"]
+                    or row["rule_triggered"] != prev["rule_triggered"]
+                )
+                if broken:
+                    _flush(current)
+                    current = []
+            current.append(row)
+        _flush(current)
+
+        danger = int(sum(1 for r in rows if r["level"] == "위험"))
+        stores.append({
+            "store_id": int(store_id),
+            "store_name": rows[0]["store_name"],
+            "meter_id": rows[0]["meter_id"],
+            "event_count": len(rows),
+            "danger_count": danger,
+            "caution_count": len(rows) - danger,
+            "episode_count": len(episodes),
+            "latest_level": rows[-1]["level"],
+            "latest_detected_at": rows[-1]["detected_at"],
+            "episodes": episodes,
+        })
+
+    # 위험이 있는 매장을 먼저, 그다음 건수가 많은 순 - 화면에서 위에 있어야 할 순서 그대로.
+    stores.sort(key=lambda s: (-s["danger_count"], -s["event_count"], s["store_id"]))
+
+    total = int(len(df))
+    danger_total = int((df["level"] == "위험").sum()) if not df.empty else 0
+    return {
+        "date": target_date.strftime("%y-%m-%d"),
+        "time": target_time.strftime("%H:%M"),
+        "from_ts": start_ts,
+        "to_ts": end_ts,
+        "store_count": len(stores),
+        "total_events": total,
+        "danger_count": danger_total,
+        "caution_count": total - danger_total,
+        "stores": stores,
+    }
+
+
 def get_anomaly_event(engine: Engine, store_id: int, detected_at: datetime) -> dict | None:
     """
     설명문 생성(ami_db.narrate)에 넣을 이벤트 1건을 DB에서 그대로 읽어온다.
