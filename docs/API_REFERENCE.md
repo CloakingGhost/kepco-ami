@@ -3,7 +3,7 @@
 > 이 문서는 `scripts/generate_api_docs.py`가 FastAPI OpenAPI 스키마에서 **자동 생성**했습니다.
 > 코드(엔드포인트·모델)를 고쳤다면 재생성하세요: `uv run python scripts/generate_api_docs.py`
 >
-> 버전: `0.1.0` · 생성 시각: `2026-09-09 15:57 UTC`
+> 버전: `0.1.0` · 생성 시각: `2026-09-10 01:42 UTC`
 
 **Base URL(로컬)**: `http://localhost:8000`  (Swagger UI: `http://localhost:8000/docs`)
 
@@ -384,6 +384,63 @@ date/time을 둘 다 생략하면 서버 "현재" 기준(`ami_db.serving.service
 
 ---
 
+### `GET /api/anomalies/period`
+**그 달 1일부터 지정 시점까지 누적 조회**
+
+**그 달 1일 00:00부터 요청한 시점까지**의 안전감지 이력을 매장별로 묶어서 돌려준다.
+
+스냅샷(`/api/anomalies/snapshot`)은 "지금 이 15분 슬롯"만 보기 때문에 사건이 없는
+시각을 고르면 늘 비어 있다. 이 엔드포인트는 누적 구간을 보므로 "이번 달에 어느
+매장에 무슨 일이 있었는지"를 한 번에 확인할 수 있다.
+
+예: `?date=26-05-13&time=16:00` -> **2026-05-01 00:00 ~ 2026-05-13 16:00** 구간
+
+**사건(episode) 단위로 묶어서 준다.** `anomaly_events`는 15분 슬롯당 1행이라 60분짜리
+사건 하나가 4행으로 남는데, 그대로 내려보내면 화면에서 같은 사건이 네 번 반복되는
+것처럼 보인다. 슬롯 간격이 15분을 넘거나 등급·규칙이 바뀌면 다른 사건으로 끊는다.
+
+매장 정렬은 **위험이 있는 매장 먼저, 그다음 건수 많은 순**이라 앞에서부터 그리면 된다.
+
+**파라미터**
+
+| 이름 | 위치 | 타입 | 필수 | 예시 | 설명 |
+|---|---|---|:---:|---|---|
+| `date` | query | `string` |  |  | 조회 기준 날짜 'YY-MM-DD'. 범위: 26-04-01 ~ 26-07-31. 생략하면 서버 현재 날짜. |
+| `time` | query | `string` |  |  | 조회 기준 시각 'HH:MM'(15분 단위). 생략하면 서버 현재 시:분. |
+
+**응답 (200)** — `AnomalyPeriodResponse`
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `date` | `string` | 조회 기준 날짜(입력값 또는 서버 현재) |
+| `time` | `string` |  |
+| `from_ts` | `string` | 그 달 1일 00:00 |
+| `to_ts` | `string` | 조회 기준 시점 |
+| `store_count` | `integer` | 기간 내 이벤트가 있었던 매장 수 |
+| `total_events` | `integer` |  |
+| `danger_count` | `integer` |  |
+| `caution_count` | `integer` |  |
+| `stores` | `AnomalyPeriodStore[]` | 매장별 누적 결과. 위험이 있는 매장이 먼저, 그다음 건수가 많은 순. |
+
+<details><summary><code>AnomalyPeriodStore</code> 필드 상세</summary>
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `store_id` | `integer` |  |
+| `store_name` | `string \| null` |  |
+| `meter_id` | `string` |  |
+| `event_count` | `integer` | 기간 내 슬롯 단위 이벤트 수 |
+| `danger_count` | `integer` |  |
+| `caution_count` | `integer` |  |
+| `episode_count` | `integer` | 연속 슬롯을 하나로 묶은 사건 수 |
+| `latest_level` | `string` |  |
+| `latest_detected_at` | `string` |  |
+| `episodes` | `AnomalyEpisode[]` | 시간순 사건 목록 |
+
+</details>
+
+---
+
 ### `POST /api/anomalies/explain`
 **감지 이벤트 설명문 생성 (LLM)**
 
@@ -417,6 +474,8 @@ KEC 212.3이라는 법정 근거를 확률 모델로 대체할 수 없다는 판
 | `owner_sms` | `string` | 점주에게 보낼 문자 초안(2~3문장, 존댓말) |
 | `admin_note` | `string` | 관리자용 점검 사유(1~2문장, 발동 규칙과 근거 수치 명시) |
 | `emergency_report` | `string \| null` | 신고 접수용 초안. level='위험'일 때만 채워지고 '주의'면 null. |
+| `next_steps` | `string[]` | 점주가 지금 할 수 있는 조치 2~3가지. '감지했다'로 끝내지 않고 '그래서 뭘 하면 되는지'까지 안내하기 위한 필드. 근거는 프롬프트에 넣어둔 참고 안내사항(한전 증설 제도 등)뿐이며 모델이 제도를 지어내지 못한다. |
+| `inquiry_draft` | `string \| null` | 점주가 한전(고객센터 123 / cyber.kepco.co.kr)이나 전기공사 업체에 그대로 보낼 수 있는 문의 초안. |
 | `verification_passed` | `boolean` | 생성문에 입력에 없던 숫자가 섞였는지 자동 대조한 결과. false면 환각 의심 - unknown_numbers에 그 숫자가 담긴다. 판정 로직이 아니라 LLM 출력 검사다. |
 | `unknown_numbers` | `string[]` | 입력 수치와 대조되지 않은 숫자 목록. 비어 있으면 통과. |
 | `model` | `string` | 생성에 사용한 모델 |

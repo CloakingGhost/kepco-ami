@@ -166,52 +166,98 @@ def detect_tick(conn, context: dict, now: datetime, lookback_hours: int) -> list
     return newly
 
 
+def group_into_episodes(events: list[dict]) -> list[list[dict]]:
+    """
+    새로 감지된 슬롯들을 **사건 단위로 묶는다**(계기별, 15분 간격 연속 + 같은 등급/규칙).
+
+    묶지 않으면 60분짜리 위험 1건에 문자가 4통 나간다 - 슬롯당 1행이라는 저장 구조를
+    그대로 알림에 노출하는 셈이라 점주 입장에서는 같은 사고로 네 번 울리는 것과 같다.
+    """
+    by_meter: dict[str, list[dict]] = {}
+    for ev in sorted(events, key=lambda e: (e["meter_id"], e["detected_at"])):
+        by_meter.setdefault(ev["meter_id"], []).append(ev)
+
+    episodes: list[list[dict]] = []
+    for rows in by_meter.values():
+        current: list[dict] = []
+        for ev in rows:
+            if current:
+                prev = current[-1]
+                broken = (
+                    ev["detected_at"] - prev["detected_at"] > timedelta(minutes=15)
+                    or ev["level"] != prev["level"]
+                    or ev["rule_triggered"] != prev["rule_triggered"]
+                )
+                if broken:
+                    episodes.append(current)
+                    current = []
+            current.append(ev)
+        if current:
+            episodes.append(current)
+    return episodes
+
+
 def notify(conn, events: list[dict]) -> None:
     """
-    새 이벤트에 대한 알림 발송 지점.
+    새 이벤트에 대한 알림 발송 지점. **사건당 1건**만 보낸다(group_into_episodes 참고).
 
     **실제 문자·메일 발송은 구현하지 않는다**(범위 밖). 대신 발송될 내용을 화면에 찍고
-    notified_at을 채워, 같은 이벤트로 두 번 알리지 않는 흐름만 완성해 둔다. 실제 채널을
-    붙일 때 이 함수 안만 바꾸면 되도록 경계를 여기로 모았다.
+    사건에 속한 모든 슬롯의 notified_at을 채워, 같은 사건으로 두 번 알리지 않는 흐름만
+    완성해 둔다. 실제 채널을 붙일 때 이 함수 안만 바꾸면 되도록 경계를 여기로 모았다.
 
     문구는 LLM 설명 계층(ami_db.narrate)을 재사용하되, 외부 API가 느리거나 죽어 있어도
-    배치가 멈추면 안 되므로 캐시 우선(prefer_cache=True)으로 호출하고 실패하면 건너뛴다.
+    배치가 멈추면 안 되므로 캐시 우선(prefer_cache=True)으로 호출하고 실패하면 템플릿으로
+    떨어진다. 이벤트 정보는 **같은 커넥션에서** 읽는다 - 방금 INSERT한 행은 커밋 전이라
+    다른 커넥션(get_engine)으로는 보이지 않아 항상 템플릿으로 떨어지는 문제가 있었다.
     """
     if not events:
         return
 
     from ami_db.narrate import narrate_event
-    from ami_db.serving import get_anomaly_event
-    from ami_db.db import get_engine
 
-    engine = get_engine()
-    for ev in events:
+    for episode in group_into_episodes(events):
+        head, tail = episode[0], episode[-1]
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT s.store_id FROM stores s WHERE s.meter_id = %s", (ev["meter_id"],)
+                """
+                SELECT s.store_id, s.name, s.biz_category_mid, m.contract_power_kw
+                FROM stores s JOIN meters m ON m.meter_id = s.meter_id
+                WHERE s.meter_id = %s
+                """,
+                (head["meter_id"],),
             )
             row = cur.fetchone()
         if not row:
             continue
-        store_id = row[0]
+        store_id, store_name, biz_mid, contract_kw = row
+
+        # 사건 대표값: 가장 높았던 관측치가 있는 슬롯을 쓴다(설명문이 최악값을 말하게).
+        peak = max(episode, key=lambda e: e["metric_value"])
+        event_for_llm = {
+            "store_id": store_id, "store_name": store_name, "biz_category_mid": biz_mid,
+            "contract_power_kw": contract_kw, "level": peak["level"],
+            "rule_triggered": peak["rule_triggered"], "detected_at": peak["detected_at"],
+            "metric_value": peak["metric_value"], "threshold_value": peak["threshold_value"],
+        }
 
         message = None
         try:
-            full = get_anomaly_event(engine, store_id, ev["detected_at"])
-            if full:
-                message = narrate_event(full, prefer_cache=True).owner_sms
+            message = narrate_event(event_for_llm, prefer_cache=True).owner_sms
         except Exception as e:  # noqa: BLE001 - 문구 생성 실패가 배치를 멈추면 안 된다
-            print(f"    (설명 생성 건너뜀: {type(e).__name__})")
+            print(f"    (설명 생성 건너뜀: {type(e).__name__} - 템플릿으로 발송)")
 
         if message is None:  # LLM을 못 쓰는 상황에서도 알림 자체는 나가야 한다
-            message = (f"[{ev['level']}] {ev['detected_at']:%m-%d %H:%M} 비영업시간 전력 이상 감지 "
-                       f"(관측 {ev['metric_value']:.2f}kWh / 임계 {ev['threshold_value']:.2f}kWh)")
+            message = (f"[{peak['level']}] {head['detected_at']:%m-%d %H:%M}~"
+                       f"{tail['detected_at']:%H:%M} 비영업시간 전력 이상 감지 "
+                       f"(최대 {peak['metric_value']:.2f}kWh / 임계 {peak['threshold_value']:.2f}kWh)")
 
-        print(f"    [발송] store_id={store_id} :: {message[:110]}")
+        span = f"{head['detected_at']:%H:%M}~{tail['detected_at']:%H:%M}"
+        print(f"    [발송] {store_name}(store_id={store_id}) {span} 슬롯{len(episode)}건")
+        print(f"           {message[:120]}")
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE anomaly_events SET notified_at = now() WHERE event_id = %s",
-                (ev["event_id"],),
+                "UPDATE anomaly_events SET notified_at = now() WHERE event_id = ANY(%s)",
+                ([e["event_id"] for e in episode],),
             )
 
 

@@ -86,6 +86,75 @@ MANUAL_SCENARIOS = [
         "kind": "caution_repeat_3",
         "detail": "매장 자체 baseline+3x floor를 60분 지속 초과 - 주의반복 데모 3/3",
     },
+    # ── 점포 확대(2026-09-10) ────────────────────────────────────────────────
+    # 위 3개 매장만으로는 "한 달 동안 상권에 무슨 일이 있었나"를 볼 수 없어(기간 조회 API
+    # 대상이 3개 매장뿐) 6개 매장을 7월 전반에 걸쳐 추가한다. 날짜를 흩뿌려 놓아야
+    # 기간 조회(그 달 1일~요청 시점)가 조회 시점에 따라 다르게 쌓이는 걸 확인할 수 있다.
+    #
+    # load_ratio 산정: 주입값 = 계약전력 x load_ratio / 4 (15분 kWh). 주의(개인화 baseline)
+    # 시나리오는 이 값이 그 매장의 "주의임계(baseline_median + 3 x floor)"를 넘되 계약전력
+    # 80%(연속부하)·130%(KEC)에는 한참 못 미치도록 잡았다. 임계값 출처는
+    # docs/안전감지_이상치_판정기준.md 3-1절 실측 baseline 표.
+    # 주입 시각은 전부 새벽(00:30~05:45)이다 - "진짜폐점" 판정이 서는 시간대여야 규칙이
+    # 평가 대상으로 삼는다.
+    {
+        "meter_id": "A-L-34", "date": date(2026, 7, 5),   # 다이소목동, 계약 25kW
+        "start_slot": 12, "duration_slots": 4,             # 03:00~03:45
+        "load_ratio": 1.55,                                # 위험 임계 130% 초과(두 번째 위험 매장)
+        "kind": "danger_overload",
+        "detail": "계약전력 155%를 60분 지속 - KEC212.3 위험 조건",
+    },
+    {
+        "meter_id": "A-L-62", "date": date(2026, 7, 9),   # 놀부부대찌개, 계약 15kW
+        "start_slot": 2, "duration_slots": 12,             # 00:30~03:15 = 3시간
+        "load_ratio": 0.92,                                # 연속부하 80% 초과, 130% 미만
+        "kind": "continuous_load",
+        "detail": "계약전력 92%를 3시간 지속 - 연속부하 80% 규칙 초과",
+    },
+    {
+        "meter_id": "A-L-11", "date": date(2026, 7, 11),  # 배떡, 계약 8kW (주의임계 0.456kWh)
+        "start_slot": 8, "duration_slots": 4,              # 02:00~02:45
+        "load_ratio": 0.30,                                # 0.60kWh - 임계 초과, 계약 30%
+        "kind": "caution_baseline",
+        "detail": "매장 자체 baseline+3x floor를 60분 지속 초과",
+    },
+    {
+        "meter_id": "A-L-72", "date": date(2026, 7, 14),  # 대박해물찜, 계약 25kW (주의임계 0.520kWh)
+        "start_slot": 16, "duration_slots": 4,             # 04:00~04:45
+        "load_ratio": 0.15,                                # 0.94kWh - 임계 초과, 계약 15%
+        "kind": "caution_baseline",
+        "detail": "매장 자체 baseline+3x floor를 60분 지속 초과",
+    },
+    # 두찜: 하루 2회 반복 - 주의반복(3회) 문턱에 못 미치는 경우도 화면에 있어야
+    # "반복 판정"이 실제로 걸러내고 있음을 보여줄 수 있다.
+    {
+        "meter_id": "A-L-80", "date": date(2026, 7, 18),  # 두찜강서, 계약 19kW (주의임계 0.665kWh)
+        "start_slot": 4, "duration_slots": 4,              # 01:00~01:45 (1/2)
+        "load_ratio": 0.20,                                # 0.95kWh - 임계 초과, 계약 20%
+        "kind": "caution_baseline_1",
+        "detail": "매장 자체 baseline+3x floor 초과 - 하루 2회 중 1회차",
+    },
+    {
+        "meter_id": "A-L-80", "date": date(2026, 7, 18),
+        "start_slot": 16, "duration_slots": 4,             # 04:00~04:45 (2/2)
+        "load_ratio": 0.20,
+        "kind": "caution_baseline_2",
+        "detail": "매장 자체 baseline+3x floor 초과 - 하루 2회 중 2회차",
+    },
+    {
+        "meter_id": "A-L-57", "date": date(2026, 7, 25),  # 분식을품다, 계약 10kW (주의임계 0.647kWh)
+        "start_slot": 12, "duration_slots": 4,             # 03:00~03:45
+        "load_ratio": 0.30,                                # 0.75kWh - 임계 초과, 계약 30%
+        "kind": "caution_baseline",
+        "detail": "매장 자체 baseline+3x floor를 60분 지속 초과",
+    },
+    {
+        "meter_id": "A-L-34", "date": date(2026, 7, 28),  # 다이소목동 재발(위험 이후 주의)
+        "start_slot": 8, "duration_slots": 4,              # 02:00~02:45
+        "load_ratio": 0.30,                                # 1.88kWh - 주의임계 1.574kWh 초과
+        "kind": "caution_baseline",
+        "detail": "매장 자체 baseline+3x floor 초과 - 같은 매장의 위험 이후 재발 이력",
+    },
 ]
 
 
