@@ -166,14 +166,14 @@ def main() -> None:
                 (store_id, r.ts, r.schedule_status, r.power_status, r.final_status, r.congestion_level)
                 for r in status_df.itertuples(index=False)
             ]
+            # upsert만 하면 시계열에서 빠진 시각의 상태 행이 근거 없이 남으므로 매장 단위로 통째로
+            # 바꾼다(10단계 anomaly_events와 같은 정책).
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM store_operating_status WHERE store_id = %s", (store_id,))
             n = bulk_insert(
                 conn, "store_operating_status",
                 ["store_id", "ts", "schedule_status", "power_status", "final_status", "congestion_level"],
                 rows,
-                on_conflict="(store_id, ts) DO UPDATE SET "
-                             "schedule_status=EXCLUDED.schedule_status, power_status=EXCLUDED.power_status, "
-                             "final_status=EXCLUDED.final_status, congestion_level=EXCLUDED.congestion_level, "
-                             "computed_at=now()",
                 page_size=20_000,
             )
             total += n
