@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, time
 
+import numpy as np
 import pandas as pd
 
 
@@ -92,35 +93,72 @@ def determine_final_status(schedule_status: str, power_status: str) -> str:
     return FINAL_STATUS_MATRIX[(schedule_status, power_status)]
 
 
-def compute_utilization_quartiles(meter_ts: pd.DataFrame, contract_power_kw: float) -> tuple[float, float]:
+# db/problem/문제상황-1.txt: "여유/보통/혼잡 기준이 명확하지 않거나 계산법이 잘못된 것
+# 같다 - 각 매장의 운영시간을 분포도로 나타낸다면 어떨까? 동시간 최대 1달을 기준으로
+# 해보자(계절성 고려하면 3개월이 이상적이나 실측이 90일뿐이라 1달로 타협)"에 따라
+# 계약전력 대비 %로 하루 전체를 통짜로 비교하던 예전 방식(compute_utilization_quartiles/
+# determine_congestion_level, 둘 다 삭제됨)을 대체한다. 계약전력 기준은 "과부하 위험에
+# 얼마나 가까운가"를 보는 안전감지(anomaly.py)의 척도이지, 사용자 화면의 "혼잡도"가
+# 보여주려는 "평소보다 붐비는가"와는 목적이 다르다고 판단해, 매장 자신의 동시간대
+# 원본 kWh 분포로 바꿨다.
+CONGESTION_WINDOW_MINUTES = 30  # 동시간대 판정에서 앞뒤로 묶는 폭(±30분 = 15분 슬롯 5개)
+CONGESTION_LOOKBACK_DAYS = 30   # 기준 산정에 쓰는 최근 실측 일수
+CONGESTION_MIN_SAMPLES = 5      # 이 미만이면 그 시간대만의 기준을 못 믿고 매장 전체로 폴백
+
+
+def compute_congestion_thresholds(
+    real_open: pd.DataFrame,
+    window_minutes: int = CONGESTION_WINDOW_MINUTES,
+    lookback_days: int = CONGESTION_LOOKBACK_DAYS,
+    min_samples: int = CONGESTION_MIN_SAMPLES,
+) -> tuple[dict[int, tuple[float, float]], tuple[float, float] | None]:
     """
-    이용률(%) = 15분 kWh를 순간 kW로 환산(x4) / 계약전력 * 100.
-    (03_visual_analysis.py의 이용률 계산식과 동일: max_kWh*4/수전전력*100)
-    Q1/Q3를 상/중/하 혼잡도 구간 경계로 쓴다(05_시각분석_AI방법론_보고서.md 4-4절:
-    소규모·저압 그룹의 이용률 분산이 크다는 실측 근거 - 계기별 상대 기준이 필요).
+    매장 "자기 자신의 동시간대 분포"로 혼잡도 경계(Q1/Q3)를 잡는다.
 
-    ★ meter_ts에는 "영업중으로 판정된 슬롯만" 넘겨야 한다. 혼잡도는 영업중일 때만
-    부여되므로, 기준선도 같은 모집단에서 잡아야 하:중:상이 25:50:25로 갈린다.
-    하루 전체(야간·휴무 포함)를 넘기면 영업중 슬롯이 대부분 상위 구간에 몰려
-    '하'가 거의 사라진다(실측 버그 이력은 09_compute_operating_status.py 주석 참고).
+    real_open: 그 매장의 "실측(is_synthetic=False) + 영업중으로 판정된" 슬롯만
+        (ts, recv_kWh 두 컬럼). 합성 구간(7월, 안전감지 데모용으로 위험/주의 시나리오가
+        일부러 심긴 이상치 구간)을 기준 산정에 섞으면 기준 자체가 오염되므로 호출부가
+        미리 걸러서 넘겨야 한다.
+
+    - 최근 lookback_days일(그 매장 실측 범위 안에서)만 쓴다 - 계절성을 고려하면 3개월이
+      이상적이나 주어진 실측이 91일뿐이라 1개월로 타협한 것(db/problem/문제상황-1.txt).
+    - "동시간대"를 글자 그대로 같은 시:분만 모으면(예: 매일 14:00 하나) 30일치라
+      슬롯당 표본이 ~30개뿐이라 분위수가 노이즈에 민감해진다. ±window_minutes(기본
+      30분 = 앞뒤 슬롯 2개씩 총 5개)를 자정을 넘나드는 원형 거리로 묶어 표본을
+      ~5배로 늘린다(요일 구분은 하지 않음 - 요일까지 쪼개면 표본이 30/7 ≈ 4개로
+      줄어 오히려 못 믿을 값이 된다).
+    - 표본이 min_samples 미만인 시간대는 그 시간대만의 기준을 신뢰할 수 없으므로,
+      이 매장의 "동시간대 구분 없는 전체" Q1/Q3(fallback)로 대체한다 - 특정 시간대만
+      운영 시작 초기라 표본이 적은 경우 등 드문 예외를 위한 안전장치다.
+
+    반환: ({슬롯(자정 이후 분): (q1,q3)}, fallback(q1,q3) 또는 표본 자체가 없으면 None).
     """
-    if not contract_power_kw or contract_power_kw <= 0:
-        return 0.0, 0.0
-    util = (meter_ts["recv_kWh"].dropna() * 4) / contract_power_kw * 100
-    if util.empty:
-        return 0.0, 0.0
-    return float(util.quantile(0.25)), float(util.quantile(0.75))
+    if real_open.empty:
+        return {}, None
 
+    cutoff = real_open["ts"].max() - pd.Timedelta(days=lookback_days - 1)
+    recent = real_open.loc[real_open["ts"] >= cutoff]
+    if recent.empty:
+        recent = real_open
 
-def determine_congestion_level(
-    observed_kwh: float | None, contract_power_kw: float, q1: float, q3: float, final_status: str,
-) -> str | None:
-    """final_status가 '영업중'이 아니면 혼잡도 자체가 의미 없으므로 None(DB엔 NULL)."""
-    if final_status != "영업중" or observed_kwh is None or pd.isna(observed_kwh) or not contract_power_kw:
-        return None
-    util = (observed_kwh * 4) / contract_power_kw * 100
-    if util <= q1:
-        return "하"
-    if util <= q3:
-        return "중"
-    return "상"
+    vals_all = recent["recv_kWh"].dropna().to_numpy()
+    fallback = (
+        (float(np.quantile(vals_all, 0.25)), float(np.quantile(vals_all, 0.75)))
+        if vals_all.size else None
+    )
+
+    tod = (recent["ts"].dt.hour * 60 + recent["ts"].dt.minute).to_numpy()
+    vals = recent["recv_kWh"].to_numpy()
+    day_minutes = 24 * 60
+
+    thresholds: dict[int, tuple[float, float]] = {}
+    for slot in np.unique(tod):
+        diff = np.abs(tod - slot)
+        circ = np.minimum(diff, day_minutes - diff)  # 자정 경계를 넘나드는 원형 거리
+        pooled = vals[circ <= window_minutes]
+        pooled = pooled[~np.isnan(pooled)]
+        if pooled.size < min_samples:
+            continue
+        thresholds[int(slot)] = (float(np.quantile(pooled, 0.25)), float(np.quantile(pooled, 0.75)))
+
+    return thresholds, fallback

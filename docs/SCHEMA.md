@@ -365,13 +365,7 @@ source별 이력을 보존합니다 — `google_places` 매칭이 성공해도 `
 
 **전력사용량 계산방법 — 어떤 필드를 곱해야 하는가?**
 **아무것도 곱하면 안 됩니다.** `received_active_power_kwh` 값 자체가 이미 "그 15분 동안 실제 사용한 전력량(kWh)"의 최종값입니다. `meters.multiplier`(배수, 계기 CT/PT 변성비)는 계기가 측정한 저전압/저전류 값을 실제 부하 값으로 환산하는 배수인데, MDMS(AMI) 원본 자체가 이미 이 배수를 반영해 제공되기 때문에 여기에 `multiplier`를 다시 곱하면 값이 수백~수천 배로 부풀려지는 오류가 납니다.
-혼잡도(이용률%) 계산에서만 추가 연산이 필요한데, 이때도 곱하는 대상은 `received_active_power_kwh`가 아니라 `contract_power_kw`로 **나누는** 것입니다:
-
-```
-이용률(%) = received_active_power_kwh × 4 ÷ contract_power_kw × 100
-```
-
-(×4는 15분 값을 1시간 기준 kW로 환산하는 계수. `ami_db.status.compute_utilization_quartiles`/`determine_congestion_level` 참고.)
+혼잡도는 `contract_power_kw`(계약전력)가 아니라 **그 매장 자신의 동시간대 `received_active_power_kwh` 분포**(최근 30일 실측, ±30분 묶음)에서 상대적 위치로 판정합니다 — 계약전력 대비 %는 안전감지(과부하 위험) 쪽 척도라, "평소보다 붐비는가"를 보여주는 혼잡도와는 목적이 달라 분리했습니다. `ami_db.status.compute_congestion_thresholds` 참고. (`contract_power_kw`는 여전히 안전감지 규칙(`ami_db.anomaly`)의 임계값 계산에 쓰입니다.)
 
 **계약종별 (`contract_type`)**
 한전과 맺은 요금제 계약 종류(예: `'일반용(을)고압A'`, `'일반용(갑)저압'`) — 계약전력 구간·전압 등급·용도에 따라 나뉘는 요금제 분류입니다. 이 프로젝트의 영업유무/혼잡도/안전감지 판정에는 직접 쓰이지 않고, 계기 성격(고압 대형 vs 저압 소형)을 파악하는 참고 정보로 `meters`에 원문 그대로 보관합니다.

@@ -2,11 +2,13 @@
 """
 2-6단계: store_operating_status를 계기 x 시각(실측+합성 전체 그리드)에 대해 채운다.
 
-night_baseline/이용률 Q1·Q3는 "실측 데이터만"으로 계산한다 - 계기의 진짜 습성을
+night_baseline/혼잡도 Q1·Q3는 "실측 데이터만"으로 계산한다 - 계기의 진짜 습성을
 보여주는 기준이어야 하는데, 합성 데이터 자체가 이 실측 통계에서 리샘플링된
 것이라 합성까지 포함해 기준을 잡으면 자기순환(그 계기가 원래 실측에서 보인
 패턴을 다시 기준으로 삼는 것뿐이라 상관없어 보이지만, 굳이 섞을 이유가 없고
 "기준은 항상 실측"이라는 원칙을 지키는 편이 설명하기 쉽다) 문제만 생긴다.
+합성 7월은 특히 안전감지 데모용으로 위험/주의 이상치가 일부러 심긴 구간이라,
+혼잡도 기준 산정에 섞으면 기준 자체가 이상치에 오염된다.
 판정 자체는 실측+합성 전체 그리드(meter_timeseries 전체)에 대해 수행한다 -
 서빙 로직이 날짜와 무관하게 항상 상태를 보여줄 수 있어야 하기 때문.
 """
@@ -22,7 +24,7 @@ from ami_db.config import VIZ_OUTPUT, settings  # noqa: E402
 from ami_db.db import bulk_insert, get_raw_connection  # noqa: E402
 from ami_db.status import (  # noqa: E402
     FINAL_STATUS_MATRIX,
-    compute_utilization_quartiles,
+    compute_congestion_thresholds,
     load_effective_hours,
 )
 from ami_db.synthetic import compute_night_baseline  # noqa: E402
@@ -38,12 +40,15 @@ def _sod(t) -> float:
 
 
 def compute_status_for_store(
-    meter_ts: pd.DataFrame, day_hours: dict[int, dict], night_baseline: float, contract_power_kw: float,
+    meter_ts: pd.DataFrame, day_hours: dict[int, dict], night_baseline: float,
     data_resolution: str = "15min",
 ) -> pd.DataFrame:
     """
     한 계기(=한 상가)의 전체 시계열(실측+합성)에 대해 벡터화 연산으로
     schedule/power/final_status와 congestion_level을 한 번에 계산한다.
+
+    meter_ts는 ts/recv_kWh 외에 is_synthetic 컬럼도 있어야 한다(혼잡도 기준을
+    실측 구간에서만 뽑기 위함 - ami_db.status.compute_congestion_thresholds 참고).
 
     data_resolution='1hour'인 계기는 recv_kWh가 NaN인 슬롯(전체의 75%, 구조적 결측)을
     판정 대상에서 아예 제외한다 - determine_power_status의 "결측이면 low로 방어 처리"
@@ -94,17 +99,26 @@ def compute_status_for_store(
         FINAL_STATUS_MATRIX[(s, p)] for s, p in zip(df["schedule_status"], df["power_status"])
     ]
 
-    # 사분위 기준선은 반드시 "영업중으로 판정된 슬롯"만으로 계산한다.
-    # 예전엔 하루 전체 슬롯(야간·휴무 포함)으로 Q1/Q3를 잡아놓고 판정은 영업중
-    # 슬롯에만 적용했는데, 영업중은 정의상 야간 baseline의 1.5배 이상이라 전체 기준
-    # Q1을 거의 항상 넘어버려 '하'(여유)가 사실상 나오지 않았다(실측: 상 58.2% /
-    # 중 41.7% / 하 0.1%(37건)). 예: store_id=12는 영업중 슬롯의 실제 Q1(20.1%)이
-    # 전체 기준 Q3(21.8%)에 육박해 구조적으로 '하'가 불가능했다. 같은 모집단(영업중)
-    # 안에서 사분위를 잡아야 하:중:상 = 25:50:25로 의미 있게 갈린다.
-    open_slots = df.loc[df["final_status"] == "영업중", ["recv_kWh"]]
-    q1, q3 = compute_utilization_quartiles(open_slots, contract_power_kw)
-    util = (df["recv_kWh"].fillna(0) * 4) / contract_power_kw * 100 if contract_power_kw else pd.Series(0, index=df.index)
-    congestion = np.select([util <= q1, util <= q3], ["하", "중"], default="상")
+    # 혼잡도 기준은 "그 매장 자신의 동시간대 분포"에서 뽑는다(db/problem/문제상황-1.txt:
+    # "여유/보통/혼잡 기준이 불명확하다 - 운영시간을 분포도로, 동시간 최대 1달을 기준으로").
+    # 실측(is_synthetic=False) + 영업중 슬롯만 넘겨야 기준이 안전감지용 이상치(합성 7월)에
+    # 오염되지 않는다. compute_congestion_thresholds()가 최근 30일·±30분 묶음으로
+    # 시간대별 Q1/Q3를 계산한다 - 시간대 구분 없이 영업중 전체를 한 덩어리로 섞던 예전
+    # 방식(compute_utilization_quartiles, 삭제됨)은 개점 직후 한산한 시간과 점심 피크가
+    # 같은 기준에 뭉뚱그려지는 문제가 있었다.
+    real_open = df.loc[(~df["is_synthetic"].astype(bool)) & (df["final_status"] == "영업중"), ["ts", "recv_kWh"]]
+    thresholds, fallback = compute_congestion_thresholds(real_open)
+
+    tod = (df["ts"].dt.hour * 60 + df["ts"].dt.minute).astype(int)
+    default_pair = fallback if fallback is not None else (np.nan, np.nan)
+    q1_by_slot = {slot: thresholds.get(slot, default_pair)[0] for slot in tod.unique()}
+    q3_by_slot = {slot: thresholds.get(slot, default_pair)[1] for slot in tod.unique()}
+    q1_arr = tod.map(q1_by_slot)
+    q3_arr = tod.map(q3_by_slot)
+
+    congestion = np.select(
+        [df["recv_kWh"].fillna(0) <= q1_arr, df["recv_kWh"].fillna(0) <= q3_arr], ["하", "중"], default="상"
+    )
     df["congestion_level"] = np.where(df["final_status"] == "영업중", congestion, None)
 
     return df
@@ -118,20 +132,20 @@ def main() -> None:
     with get_raw_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT s.store_id, s.meter_id, m.contract_power_kw, m.data_resolution "
+                "SELECT s.store_id, s.meter_id, m.data_resolution "
                 "FROM stores s JOIN meters m ON m.meter_id = s.meter_id ORDER BY s.store_id"
             )
             stores = cur.fetchall()
         hours_by_store = load_effective_hours(conn)
 
         total = 0
-        for store_id, meter_id, contract_power_kw, data_resolution in stores:
+        for store_id, meter_id, data_resolution in stores:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT ts, received_active_power_kwh FROM meter_timeseries "
+                    "SELECT ts, received_active_power_kwh, is_synthetic FROM meter_timeseries "
                     "WHERE meter_id = %s ORDER BY ts", (meter_id,),
                 )
-                full_ts = pd.DataFrame(cur.fetchall(), columns=["ts", "recv_kWh"])
+                full_ts = pd.DataFrame(cur.fetchall(), columns=["ts", "recv_kWh", "is_synthetic"])
             if full_ts.empty:
                 continue
 
@@ -139,7 +153,7 @@ def main() -> None:
             night_baseline = compute_night_baseline(real_ts)
             day_hours = hours_by_store.get(store_id, {})
 
-            status_df = compute_status_for_store(full_ts, day_hours, night_baseline, contract_power_kw, data_resolution)
+            status_df = compute_status_for_store(full_ts, day_hours, night_baseline, data_resolution)
             # pandas는 object 컬럼에 들어간 Python None을 저장 시 조용히 NaN(float)으로
             # 바꿔버리는 경우가 있다(congestion_level이 '영업중'이 아닐 때 NULL이어야 하는데
             # np.where(..., None)으로 넣은 None이 DataFrame에 들어가면서 NaN이 되는 걸 실측으로
