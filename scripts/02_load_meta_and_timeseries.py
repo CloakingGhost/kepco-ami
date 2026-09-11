@@ -34,13 +34,13 @@ def load_meters(conn, step1_csv: Path, timeseries_pkl: Path, matched_meter_ids: 
 
     data_completeness/data_resolution은 timeseries_clean.pkl에서 A선로 64개 전체에 대해
     직접 재계산한다. 그리드 크기는 8736 고정이 아니라 실측 min~max 타임스탬프 range로
-    동적 계산(실제로는 8737 - 91일치 range가 8736 슬롯보다 1개 더 많다).
+    동적 계산(실제로는 8737 - 91일치 range가 8736 슬롯보다 1개 더 많다). 1시간 적산 계기는
+    15분으로 분해한 뒤를 기준으로 재므로 '15min'으로 잡힌다(resolution.load_real_timeseries).
     """
     step1 = pd.read_csv(step1_csv, encoding="utf-8-sig")
     step1 = step1[step1["선로명"] == settings.target_line].copy()
 
-    ts_all = pd.read_pickle(timeseries_pkl)
-    ts_a = ts_all[ts_all["meter_id"].isin(set(step1["meter_id"]))]
+    ts_a = resolution.load_real_timeseries(timeseries_pkl, set(step1["meter_id"]))
     grid_size = len(pd.date_range(ts_a["time"].min(), ts_a["time"].max(), freq="15min"))
 
     completeness_by_meter: dict[str, float] = {}
@@ -88,7 +88,12 @@ def load_meters(conn, step1_csv: Path, timeseries_pkl: Path, matched_meter_ids: 
         "contract_type", "usage_purpose", "multiplier", "has_der", "main_product",
         "ksic_code", "category_class", "power_class", "data_completeness", "data_resolution", "match_status",
     ]
-    return bulk_insert(conn, "meters", cols, rows, on_conflict="(meter_id) DO NOTHING")
+    # 재실행하면 해상도/완전성만 원천 재계산값으로 갱신한다(나머지 메타는 최초 적재값 유지).
+    return bulk_insert(
+        conn, "meters", cols, rows,
+        on_conflict="(meter_id) DO UPDATE SET data_completeness=EXCLUDED.data_completeness, "
+                    "data_resolution=EXCLUDED.data_resolution",
+    )
 
 
 def load_stores(conn, matched_csv: Path) -> dict:
@@ -137,74 +142,17 @@ def load_ksic_estimated_hours(conn, matched_csv: Path, store_id_map: dict) -> in
     return bulk_insert(conn, "store_operating_hours", cols, rows, on_conflict="(store_id, source, day_of_week) DO NOTHING")
 
 
-def load_real_timeseries(conn, timeseries_pkl: Path, matched: pd.DataFrame) -> int:
+def load_real_timeseries(conn, timeseries_pkl: Path, meter_ids: set) -> int:
     """
-    실측 timeseries_clean.pkl에서 matched 계기(~21개)만 필터해 적재.
-    is_synthetic=False 고정 - 이 값이 있어야 서빙 로직이 실측/합성을 구분할 수 있다.
+    실측 timeseries_clean.pkl에서 matched 계기(~21개)만 필터해 적재. is_synthetic=False 고정.
     NaN은 psycopg2가 그대로 NULL로 넣지 못하므로 None으로 치환한다.
 
-    data_resolution='1hour'인 계기 중 같은 업종 코호트(15min 정상 해상도)가 3개 이상
-    있으면 resolution.build_hourly_ratio_table()/redistribute_hourly_store()로 15/30/45분을
-    보충한다(정각 실측에 코호트 상대 비율을 곱한 추정값, is_redistributed=True). 코호트가
-    부족한 나머지 계기는 원래 정각 실측만 그대로 적재하고 넘어간다 - meters.data_resolution
-    플래그가 이미 "이 계기는 1시간 해상도"임을 투명하게 드러내므로 그걸로 충분하다.
+    1시간 적산 계기는 resolution.load_real_timeseries()가 정각값을 15분 구간 4개로 분해한
+    값(is_redistributed=True)을 싣는다. 재실행하면 이 계기들의 실측 행을 지우고 다시 넣는다 -
+    예전엔 재분배 행을 먼저 넣고 원본을 DO NOTHING으로 넣어서, 재분배 행이 차지한 자리의
+    원본 전압·전류가 조용히 버려졌다(A-L-58의 15/30/45분 V/I 6,505개 유실).
     """
-    meter_ids = set(matched["meter_id"])
-    ts = pd.read_pickle(timeseries_pkl)
-    ts = ts[ts["meter_id"].isin(meter_ids)].copy()
-
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT meter_id, data_resolution FROM meters WHERE meter_id = ANY(%s)", (list(meter_ids),)
-        )
-        resolution_by_meter = dict(cur.fetchall())
-
-    hourly_meters = [m for m in meter_ids if resolution_by_meter.get(m) == "1hour"]
-
-    # (meter_id, ts, recv_kWh) - 재분배로 새로 계산된 15/30/45분 값. 원본 행이 이미 있든(대개
-    # recv_kWh=NULL이지만 전압/전류는 정상) 아예 없든(47개 완전 누락 케이스) 구분하지 않고
-    # 나중에 upsert로 먼저 적용한다.
-    extra_rows: list[tuple] = []
-    # 아래 두 dict는 DB/parquet 어디에도 남지 않는 "이 코호트 비율표가 실제로 뭐였는지"를
-    # 감사할 수 있게 output/generated/에 JSON으로 남기기 위한 것 (resolution.write_redistribution_report 참고).
-    applied_report: dict[str, dict] = {}
-    skipped_report: dict[str, str] = {}
-    for meter_id in hourly_meters:
-        target_row = matched.loc[matched["meter_id"] == meter_id]
-        if target_row.empty:
-            skipped_report[meter_id] = "matched 목록에 없음 (00단계 산출물에서 누락)"
-            continue
-        biz_mid = target_row["biz_category_mid"].iloc[0]
-        biz_large = target_row["biz_category_large"].iloc[0]
-
-        cohort_ids = resolution.cohort_meter_ids(matched, resolution_by_meter, meter_id, biz_mid, biz_large)
-        if len(cohort_ids) < resolution.MIN_COHORT_SIZE:
-            skipped_report[meter_id] = f"코호트 부족 (biz_mid={biz_mid}, biz_large={biz_large}, 확보 {len(cohort_ids)}개 < {resolution.MIN_COHORT_SIZE})"
-            continue
-
-        cohort_ts = ts.loc[ts["meter_id"].isin(cohort_ids), ["time", "recv_kWh"]]
-        ratios = resolution.build_hourly_ratio_table(cohort_ts)
-        if not ratios:
-            skipped_report[meter_id] = f"코호트({len(cohort_ids)}개)는 확보했지만 유효한 시간대별 비율이 하나도 없음"
-            continue
-
-        target_ts = ts.loc[ts["meter_id"] == meter_id, ["time", "recv_kWh"]]
-        redistributed = resolution.redistribute_hourly_store(target_ts, ratios)
-        new_only = redistributed[redistributed["is_redistributed"]]
-        for row in new_only.itertuples(index=False):
-            extra_rows.append((meter_id, row.time, float(row.recv_kWh)))
-        applied_report[meter_id] = {
-            "biz_category_mid": biz_mid,
-            "biz_category_large": biz_large,
-            "cohort_meter_ids": cohort_ids,
-            "hourly_ratios": {str(h): list(r) for h, r in ratios.items()},
-            "redistributed_row_count": int(len(new_only)),
-        }
-        print(f"    -> {meter_id} 코호트 재분배: {len(new_only)}행 신규/보충 (코호트 {len(cohort_ids)}개, biz_mid={biz_mid})")
-
-    report_path = GENERATED_DIR / f"redistribution_ratios_{settings.target_dong}.json"
-    resolution.write_redistribution_report(report_path, "02_load_meta_and_timeseries.py", applied_report, skipped_report)
-    print(f"    (코호트 비율표 감사 리포트 저장: {report_path})")
+    ts = resolution.load_real_timeseries(timeseries_pkl, meter_ids)
 
     cols_map = [
         ("meter_id", "meter_id"),
@@ -214,36 +162,20 @@ def load_real_timeseries(conn, timeseries_pkl: Path, matched: pd.DataFrame) -> i
         ("V_A", "voltage_a"), ("V_B", "voltage_b"), ("V_C", "voltage_c"),
         ("I_a", "current_a"), ("I_b", "current_b"), ("I_c", "current_c"),
     ]
-    src_cols = [c[0] for c in cols_map]
-    dst_cols = [c[1] for c in cols_map] + ["is_synthetic", "is_redistributed"]
+    src_cols = [c[0] for c in cols_map] + ["is_redistributed"]
+    dst_cols = [c[1] for c in cols_map] + ["is_redistributed", "is_synthetic"]
 
     subset = ts[src_cols].replace({np.nan: None})
-    rows = [tuple(row) + (False, False) for row in subset.itertuples(index=False, name=None)]
+    # numpy.bool_은 psycopg2가 적응하지 못하므로 파이썬 bool로 바꿔 넣는다.
+    rows = [tuple(row[:-1]) + (bool(row[-1]), False) for row in subset.itertuples(index=False, name=None)]
+
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM meter_timeseries WHERE meter_id = ANY(%s) AND NOT is_synthetic", (list(meter_ids),))
 
     total = 0
     chunk = 20_000
-
-    # 재분배 값을 먼저 upsert한다(recv_kWh/is_redistributed만 갱신 - 이미 있던 행의 전압/전류는
-    # 건드리지 않는다). 그 다음에 원본 전체 행을 DO NOTHING으로 적재해야, 재분배로 채운 값이
-    # 원본의 NULL로 덮어써지지 않는다(먼저 원본을 넣으면 재분배 값이 DO NOTHING에 막혀 유실됨).
-    if extra_rows:
-        extra_full_rows = [
-            (meter_id, ts_value, recv_kwh, None, None, None, None, None, None, None, False, True)
-            for meter_id, ts_value, recv_kwh in extra_rows
-        ]
-        for i in range(0, len(extra_full_rows), chunk):
-            total += bulk_insert(
-                conn, "meter_timeseries", dst_cols, extra_full_rows[i:i + chunk],
-                on_conflict="(meter_id, ts) DO UPDATE SET "
-                             "received_active_power_kwh=EXCLUDED.received_active_power_kwh, "
-                             "is_redistributed=EXCLUDED.is_redistributed",
-            )
-
     for i in range(0, len(rows), chunk):
-        total += bulk_insert(
-            conn, "meter_timeseries", dst_cols, rows[i:i + chunk],
-            on_conflict="(meter_id, ts) DO NOTHING",
-        )
+        total += bulk_insert(conn, "meter_timeseries", dst_cols, rows[i:i + chunk])
     return total
 
 
@@ -265,7 +197,7 @@ def main() -> None:
         n = load_ksic_estimated_hours(conn, matched_csv, store_id_map)
         print(f"[3/4] store_operating_hours(ksic_estimate) 적재: {n}행 (매장수 x 7요일)")
 
-        n = load_real_timeseries(conn, timeseries_pkl, matched[["meter_id", "biz_category_large", "biz_category_mid"]])
+        n = load_real_timeseries(conn, timeseries_pkl, matched_meter_ids)
         print(f"[4/4] meter_timeseries(실측) 적재: {n}행")
 
 

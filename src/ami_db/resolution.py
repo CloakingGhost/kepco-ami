@@ -1,60 +1,36 @@
 # -*- coding: utf-8 -*-
 """
-1시간 해상도 계기(recv_kWh가 매시 정각에만 존재) 탐지 + 한식 코호트 기반 재분배.
+1시간 적산 계기(recv_kWh가 매시 정각에만 있는 계기) 탐지 + 15분 구간 분해.
 
-배경(직접 데이터로 확인): 화곡동 매칭 21개 중 5개 계기(A-L-16/19/49/58/70)는
-recv_kWh가 매시 정각에만 찍히고 15/30/45분은 91일 전체 예외 0건으로 항상 결측이다
-(무작위 결측이 아니라 계기 통신 사양 차이). 억지로 15분 정밀도를 만들어내지 않고
-해상도 차이를 투명하게 드러내는 게 기본 방침(meters.data_resolution 플래그)이지만,
-한식당(A-L-58)은 20~30분 회전 주기가 있어 1시간 해상도로는 혼잡도 표현이 너무
-거칠다 - 이 계기 하나에 한해 같은 업종(한식) 코호트의 시간 내 상대 형태를 정각
-실측값에 앵커링해 15/30/45분을 추정 보충한다("시간합계 4등분"이 아니라 "정각값을
-기준점 삼아 코호트 상대 비율을 곱하는" 방식 - 정각값의 크기가 이웃 매장 15분값과
-비슷한 스케일이라 "그 15분 사용량 중 1개만 리포트되고 나머지는 유실"로 해석하는 게
-맞다는 게 실측으로 확인됨).
+화곡동 매칭 21개 중 5개 계기(A-L-16/19/49/58/70)는 에너지 레지스터(kWh·kVAh·무효전력량)가
+매시 정각에만 찍힌다. 그 정각값은 "15분값 하나만 남고 셋이 유실된 것"이 아니라 **정각 T로
+끝나는 1시간(T-45, T-30, T-15, T로 끝나는 15분 구간 4개)의 적산값**이다 - 같은 계기의 15분
+평균 전압·전류로 만든 피상전력을 그 4개 구간에 걸쳐 적분하면 정각 kVAh와 ±0.3% 이내로
+일치한다. 근거와 검증 수치는 db/docs/시간적산계기_15분분해_분석보고서.md.
+
+그래서 정각 적산값을 그 4개 구간에 V×I 비율로 나눠 담는다(split_hourly_energy). 시간 합계가
+실측 그대로 보존되고 역률 가정이 필요 없다. 전압·전류가 아예 없는 계기(A-L-49)는 모양
+정보가 없으니 4등분한다. 분해된 슬롯은 전부 is_redistributed=True.
+
+원천 pkl을 읽는 모든 단계(02 적재, 06 합성, 09 상태, 10 안전감지)가 load_real_timeseries()로
+같은 분해 결과를 봐야 한다 - 한 곳이라도 원본 pkl을 직접 읽으면 그 단계만 1시간 적산
+스케일(15분값의 ~4배)로 계산하게 된다.
 """
 from __future__ import annotations
 
-import json
-from datetime import datetime, timezone
+from collections.abc import Iterable
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
-MIN_COHORT_SIZE = 3  # 재분배용 코호트(같은 업종, 15min 정상 해상도) 최소 계기 수 - 미만이면 재분배 포기
-
-
-def cohort_meter_ids(
-    matched: pd.DataFrame,
-    resolution_by_meter: dict[str, str],
-    target_meter_id: str,
-    biz_mid,
-    biz_large,
-) -> list[str]:
-    """
-    target_meter_id와 같은 업종(중분류 우선, 부족하면 대분류로 확대)이면서 15min 정상
-    해상도인 다른 matched 계기 id 목록. 02(실측 적재)/06(합성 생성) 양쪽이 각자 실행
-    컨텍스트에서 재분배를 다시 계산할 때 동일한 코호트 선정 규칙을 쓰도록 공유한다.
-
-    matched: meter_id/biz_category_mid/biz_category_large 컬럼을 가진 DataFrame.
-    중분류 코호트가 MIN_COHORT_SIZE 이상이면 그걸 그대로 쓰고, 부족하면 대분류로
-    확대한 결과를 반환한다(그래도 부족하면 호출부가 재분배를 포기 - len() < MIN_COHORT_SIZE 체크는
-    호출부 책임).
-    """
-    def eligible(mask) -> list[str]:
-        cand = matched.loc[mask & (matched["meter_id"] != target_meter_id), "meter_id"]
-        return [m for m in cand if resolution_by_meter.get(m) == "15min"]
-
-    mid_cohort = eligible(matched["biz_category_mid"] == biz_mid)
-    if len(mid_cohort) >= MIN_COHORT_SIZE:
-        return mid_cohort
-    return eligible(matched["biz_category_large"] == biz_large)
+RECV_ENERGY_COLS = ["recv_kVAh", "recv_kWh", "recv_lag_kvarh", "recv_lead_kvarh"]
+_HOUR_WINDOW = [pd.Timedelta(minutes=m) for m in (45, 30, 15, 0)]  # 정각 T로 끝나는 15분 구간 4개
 
 
 def detect_data_resolution(meter_ts: pd.DataFrame, min_samples: int = 100) -> str:
     """
-    meter_ts: 'time'/'recv_kWh' 컬럼을 가진 한 계기분 실측 시계열(synthetic.build_slot_profile과
-    동일 스키마 관례).
+    meter_ts: 'time'/'recv_kWh' 컬럼을 가진 한 계기분 실측 시계열.
 
     비non-null 값 전부가 정각(minute==0)이면 '1hour', 아니면 '15min'.
     표본이 min_samples 미만이면(A-L-84처럼 사실상 데이터가 거의 없는 계기) 공집합에서
@@ -68,105 +44,64 @@ def detect_data_resolution(meter_ts: pd.DataFrame, min_samples: int = 100) -> st
     return "15min"
 
 
-def build_hourly_ratio_table(cohort_ts: pd.DataFrame) -> dict[int, tuple[float, float, float, float]]:
+def _apparent_power(meter_ts: pd.DataFrame) -> pd.Series:
+    """상별 V×I 합. 비율로만 쓰므로 1/1000·1/√3 같은 상수배는 생략한다."""
+    phases = [meter_ts[v] * meter_ts[i] for v, i in (("V_A", "I_a"), ("V_B", "I_b"), ("V_C", "I_c"))]
+    return pd.concat(phases, axis=1).sum(axis=1, min_count=1)
+
+
+def split_hourly_energy(meter_ts: pd.DataFrame) -> pd.DataFrame:
     """
-    cohort_ts: 15분 정상 해상도인 코호트 계기들을 합친 'time'/'recv_kWh' 시계열.
+    한 계기(1시간 적산)의 원천 행 -> 정각 적산값을 15분 구간 4개로 나눈 행.
 
-    (hour, minute)로 그룹핑한 평균을 구하고, 정각(minute=0) 평균 대비 상대 비율로
-    정규화한다. 정각 평균이 0/NaN이거나 15/30/45분 중 하나라도 그 시간대 표본이
-    없는 시간대는 결과에서 제외한다(재분배 기준점 자체가 무의미하므로).
+    - 구간 몫 = 그 구간의 V×I ÷ 4개 구간 V×I 합. V×I가 빠진 구간은 같은 시간의 나머지 평균으로
+      채우고, 4개 모두 없거나 합이 0이면 4등분한다.
+    - 원천에 행이 없던 구간은 새로 만든다(전압·전류는 NULL).
+    - 데이터 시작 이전 구간(첫 정각의 앞 45분)은 몫만 계산에 반영하고 행은 버린다.
 
-    반환: {hour: (1.0, ratio_15, ratio_30, ratio_45)}
+    반환: 입력과 같은 컬럼 + is_redistributed(분해된 구간 True).
     """
-    df = cohort_ts.dropna(subset=["recv_kWh"]).copy()
-    df["hour"] = df["time"].dt.hour
-    df["minute"] = df["time"].dt.minute
-    means = df.groupby(["hour", "minute"])["recv_kWh"].mean()
+    g = meter_ts.set_index("time").sort_index()
+    hours = g.index[(g.index.minute == 0) & g["recv_kWh"].notna()]
 
-    ratios: dict[int, tuple[float, float, float, float]] = {}
-    for hour in range(24):
-        if (hour, 0) not in means.index:
-            continue
-        mean_00 = means.loc[(hour, 0)]
-        if pd.isna(mean_00) or mean_00 == 0:
-            continue
+    slots = pd.DataFrame({
+        "time": np.concatenate([(hours - off).to_numpy() for off in _HOUR_WINDOW]),
+        "T": np.tile(hours.to_numpy(), len(_HOUR_WINDOW)),
+    })
+    power = pd.Series(_apparent_power(g).reindex(slots["time"]).to_numpy(), index=slots.index)
+    power = power.fillna(power.groupby(slots["T"]).transform("mean"))
+    total = power.groupby(slots["T"]).transform("sum")
+    share = (power / total).where(total > 0, 0.25).fillna(0.25).to_numpy()
 
-        values: list[float] = []
-        for minute in (0, 15, 30, 45):
-            if (hour, minute) not in means.index or pd.isna(means.loc[(hour, minute)]):
-                values = []
-                break
-            values.append(float(means.loc[(hour, minute)]) / float(mean_00))
-        if values:
-            ratios[hour] = tuple(values)  # type: ignore[assignment]
+    for col in RECV_ENERGY_COLS:
+        slots[col] = g[col].reindex(slots["T"]).to_numpy() * share
+    slots = slots[slots["time"] >= g.index.min()]
 
-    return ratios
+    idx = pd.DatetimeIndex(slots["time"])
+    out = g.reindex(g.index.union(idx))
+    out.loc[idx, RECV_ENERGY_COLS] = slots[RECV_ENERGY_COLS].to_numpy()
+    out["meter_id"] = g["meter_id"].iloc[0]
+    if "선로명" in out.columns:
+        out["선로명"] = g["선로명"].iloc[0]
+    out["is_redistributed"] = out.index.isin(idx)
+    return out.rename_axis("time").reset_index()
 
 
-def redistribute_hourly_store(
-    target_ts: pd.DataFrame, ratios: dict[int, tuple[float, float, float, float]]
-) -> pd.DataFrame:
+def load_real_timeseries(timeseries_pkl: Path, meter_ids: Iterable[str] | None = None) -> pd.DataFrame:
     """
-    target_ts: 'time'/'recv_kWh' 컬럼의 1시간 해상도 계기 데이터(정각만 실측 존재).
-
-    정각 실측이 있는 각 시간에 대해 15/30/45분 슬롯 3개를 원래 존재 여부와 무관하게
-    항상 새로 구성한다(NULL로 존재하던 행이든, 행 자체가 아예 없던 케이스든 이 함수
-    안에서는 구분하지 않고 동일하게 취급 - 호출부가 반환값을 그대로 insert 대상에
-    합류시키면 된다). 정각 행은 is_redistributed=False로 원값 그대로 보존하고,
-    새로 만든 15/30/45분 행은 is_redistributed=True로 표시한다. 코호트 비율표에
-    없는 시간대(그 시간대 표본이 코호트에도 부족)는 정각값만 남기고 보충하지 않는다.
-
-    반환 컬럼: time, recv_kWh, is_redistributed (다른 계측 컬럼(전압/전류 등)은 이 함수의
-    관심사가 아니다 - 새로 만든 행에 대해 그 값들을 지어내지 않고 NULL로 두는 처리는
-    호출부에서 한다).
+    visualize_analyis_data/output/timeseries_clean.pkl을 읽어, 1시간 적산 계기는 15분으로
+    분해해 돌려준다(원본 pkl 컬럼 + is_redistributed). 원천 pkl을 읽는 모든 단계의 단일 진입점.
     """
-    hourly = target_ts.dropna(subset=["recv_kWh"])
-    hourly = hourly[hourly["time"].dt.minute == 0]
+    ts = pd.read_pickle(timeseries_pkl)
+    if meter_ids is not None:
+        ts = ts[ts["meter_id"].isin(set(meter_ids))]
 
-    rows = []
-    for _, r in hourly.iterrows():
-        hour_ts = r["time"]
-        rows.append({"time": hour_ts, "recv_kWh": float(r["recv_kWh"]), "is_redistributed": False})
-
-        hour_ratios = ratios.get(hour_ts.hour)
-        if hour_ratios is None:
-            continue
-        _, r15, r30, r45 = hour_ratios
-        for minute, ratio in ((15, r15), (30, r30), (45, r45)):
-            rows.append({
-                "time": hour_ts + pd.Timedelta(minutes=minute),
-                "recv_kWh": float(r["recv_kWh"]) * ratio,
-                "is_redistributed": True,
-            })
-
-    return pd.DataFrame(rows, columns=["time", "recv_kWh", "is_redistributed"]).sort_values("time").reset_index(drop=True)
-
-
-def write_redistribution_report(
-    path: Path,
-    source_script: str,
-    applied: dict[str, dict],
-    skipped: dict[str, str],
-) -> None:
-    """
-    02/06단계가 실제로 계산한 코호트 비율표를 감사(audit) 가능하게 파일로 남긴다.
-
-    이 비율표는 그 자체로는 DB 어디에도 저장되지 않는다(02와 06이 각자 재계산해서
-    바로 소비하고 버리는 게 원래 설계 - 09가 pkl을 독립적으로 재읽어 night_baseline을
-    다시 계산하는 것과 동일한 패턴). "왜 이 값이 나왔는지"를 나중에 다시 계산 없이
-    확인하려면 이 리포트가 유일한 창구이므로, 02/06 둘 다 실행할 때마다 자기 몫을 남긴다.
-
-    applied: {meter_id: {"biz_category_mid":.., "biz_category_large":.., "cohort_meter_ids":[..],
-                          "hourly_ratios": {hour: [1.0, r15, r30, r45]}, "redistributed_row_count":..}}
-    skipped: {meter_id: "코호트 부족(N개)" 같은 사유 문자열} - data_resolution='1hour'인데 재분배를
-             적용하지 않은 계기들 (해상도 플래그만 남은 이유를 추적할 수 있게 함)
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "source_script": source_script,
-        "min_cohort_size": MIN_COHORT_SIZE,
-        "applied": applied,
-        "skipped": skipped,
-    }
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    parts = []
+    for _, g in ts.groupby("meter_id", sort=False):
+        if detect_data_resolution(g) == "1hour":
+            parts.append(split_hourly_energy(g))
+        else:
+            parts.append(g.assign(is_redistributed=False))
+    if not parts:
+        return ts.assign(is_redistributed=False)
+    return pd.concat(parts, ignore_index=True).sort_values(["meter_id", "time"], ignore_index=True)

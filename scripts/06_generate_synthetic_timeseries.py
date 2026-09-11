@@ -164,8 +164,9 @@ def main() -> None:
     meter_ids = matched["meter_id"].tolist()
 
     print(f"[1/5] 실측 시계열 로드 및 계기별 필터: {len(meter_ids)}개 계기")
-    ts_all = pd.read_pickle(VIZ_OUTPUT / "timeseries_clean.pkl")
-    ts_all = ts_all[ts_all["meter_id"].isin(meter_ids)]
+    ts_all = resolution.load_real_timeseries(VIZ_OUTPUT / "timeseries_clean.pkl", meter_ids)
+    # 실측 자체가 1시간 적산을 15분으로 분해한 추정값인 계기 - 그 프로파일에서 나온 합성값에도 표시를 물려준다.
+    split_meters = set(ts_all.loc[ts_all["is_redistributed"], "meter_id"])
 
     with get_raw_connection() as conn:
         # meter_id -> store_id, store_id별 요일별 유효 운영시간(google_places 우선)
@@ -174,46 +175,12 @@ def main() -> None:
             meter_to_store = dict(cur.fetchall())
         hours_by_store = load_effective_hours(conn)
 
-        # 02단계가 이미 계산해 둔 data_resolution을 재사용 - 여기서도 02와 동일한 코호트
-        # 재분배를 각자 다시 계산해서 적용한다(같은 resolution.py 함수 공유, pkl을 독립적으로
-        # 재읽는 기존 09단계 패턴과 동일).
-        with conn.cursor() as cur:
-            cur.execute("SELECT meter_id, data_resolution FROM meters WHERE meter_id = ANY(%s)", (meter_ids,))
-            resolution_by_meter = dict(cur.fetchall())
-
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT meter_id, contract_power_kw FROM meters WHERE meter_id = ANY(%s)",
                 ([s["meter_id"] for s in MANUAL_SCENARIOS],),
             )
             manual_contract_kw = dict(cur.fetchall())
-
-    ratios_by_meter: dict[str, dict[int, tuple]] = {}
-    meter_meta_by_meter: dict[str, dict] = {}  # 감사 리포트용 - biz_mid/biz_large/cohort_ids
-    skipped_report: dict[str, str] = {}
-    for meter_id in meter_ids:
-        if resolution_by_meter.get(meter_id) != "1hour":
-            continue
-        target_row = matched.loc[matched["meter_id"] == meter_id]
-        if target_row.empty:
-            skipped_report[meter_id] = "matched 목록에 없음 (00단계 산출물에서 누락)"
-            continue
-        biz_mid = target_row["biz_category_mid"].iloc[0]
-        biz_large = target_row["biz_category_large"].iloc[0]
-        cohort_ids = resolution.cohort_meter_ids(matched, resolution_by_meter, meter_id, biz_mid, biz_large)
-        if len(cohort_ids) < resolution.MIN_COHORT_SIZE:
-            skipped_report[meter_id] = f"코호트 부족 (biz_mid={biz_mid}, biz_large={biz_large}, 확보 {len(cohort_ids)}개 < {resolution.MIN_COHORT_SIZE})"
-            continue
-        cohort_ts = ts_all.loc[ts_all["meter_id"].isin(cohort_ids), ["time", "recv_kWh"]]
-        ratios = resolution.build_hourly_ratio_table(cohort_ts)
-        if not ratios:
-            skipped_report[meter_id] = f"코호트({len(cohort_ids)}개)는 확보했지만 유효한 시간대별 비율이 하나도 없음"
-            continue
-        ratios_by_meter[meter_id] = ratios
-        meter_meta_by_meter[meter_id] = {
-            "biz_category_mid": biz_mid, "biz_category_large": biz_large, "cohort_meter_ids": cohort_ids,
-        }
-        print(f"  -> {meter_id} 합성 프로파일도 코호트 재분배 적용 (코호트 {len(cohort_ids)}개, biz_mid={biz_mid})")
 
     effective_hours_by_meter = {
         m: hours_by_store.get(meter_to_store[m], {}) for m in meter_ids if m in meter_to_store
@@ -245,14 +212,6 @@ def main() -> None:
             print(f"  ⚠ {meter_id}: 실측 시계열이 없어 건너뜀")
             continue
 
-        ratios = ratios_by_meter.get(meter_id)
-        is_redistributed_meter = ratios is not None
-        if is_redistributed_meter:
-            # 프로파일 산출 전에 정각 실측을 코호트 비율로 재분배해 15/30/45분을 보충한다 -
-            # 이렇게 안 하면 이 계기들의 (요일x슬롯) 그룹이 91일 내내 전부 NaN이라
-            # build_slot_profile이 여전히 NaN을 그대로 반환하고 만다(정각만 프로파일링됨).
-            meter_ts = resolution.redistribute_hourly_store(meter_ts[["time", "recv_kWh"]], ratios)
-
         profile = build_slot_profile(meter_ts)
         night_baseline = compute_night_baseline(meter_ts)
 
@@ -280,33 +239,12 @@ def main() -> None:
                     "detail": f"{sc['detail']} (계약전력 {cp}kW, 수동 주입)",
                 })
             day_df["meter_id"] = meter_id
-            # 재분배 적용 계기(A-L-58)는 15/30/45분 슬롯(정각이 아닌 슬롯)이 코호트 비율로
-            # 추정된 프로파일에서 파생됐음을 그대로 물려준다 - 정각(slot%4==0) 슬롯은 실측
-            # 정각 분포에서 샘플링된 것이라 False 유지.
-            day_df["is_redistributed"] = (day_df["slot"] % 4 != 0) if is_redistributed_meter else False
+            day_df["is_redistributed"] = meter_id in split_meters
             all_days.append(day_df)
 
     synthetic_ts = pd.concat(all_days, ignore_index=True)
     synthetic_ts = synthetic_ts[["meter_id", "ts", "recv_kWh", "is_redistributed"]]
     synthetic_ts["is_synthetic"] = True
-
-    # 코호트 비율표는 DB/parquet 어디에도 남지 않으므로(각 실행마다 재계산 후 소비하고 버림),
-    # "이 합성 데이터가 실제로 어떤 비율로 재분배됐는지" 감사용 JSON을 별도로 남긴다.
-    redistributed_counts = (
-        synthetic_ts[synthetic_ts["is_redistributed"]].groupby("meter_id").size().to_dict()
-    )
-    applied_report = {
-        meter_id: {
-            **meter_meta_by_meter[meter_id],
-            "hourly_ratios": {str(h): list(r) for h, r in ratios_by_meter[meter_id].items()},
-            "redistributed_row_count": int(redistributed_counts.get(meter_id, 0)),
-        }
-        for meter_id in ratios_by_meter
-    }
-    report_path = GENERATED_DIR / f"redistribution_ratios_synthetic_{settings.target_dong}.json"
-    resolution.write_redistribution_report(
-        report_path, "06_generate_synthetic_timeseries.py", applied_report, skipped_report
-    )
 
     print(f"[5/5] 저장 중... 총 {len(synthetic_ts)}행")
     GENERATED_DIR.mkdir(parents=True, exist_ok=True)
@@ -316,7 +254,6 @@ def main() -> None:
     pd.DataFrame(scenario_log_rows).to_csv(log_path, index=False, encoding="utf-8-sig")
 
     print(f"저장: {parquet_path}")
-    print(f"저장: {report_path} (코호트 비율표 감사 리포트)")
     print(f"저장: {log_path} ({len(scenario_log_rows)}건 시나리오 기록 - QA용, DB 비적재)")
 
 

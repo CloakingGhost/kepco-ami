@@ -326,11 +326,11 @@ def get_stores_snapshot(engine: Engine, date_str: str, time_str: str) -> dict:
     한 번에 반환한다. "이 시각 기준 지도"를 그리려고 매장마다 따로 호출할 필요 없게 만드는
     목적(get_current_status_all의 "지금 이 순간" 버전을 "임의 과거/미래 시각"으로 일반화한 것).
 
-    해상도 처리: 매장의 계기가 data_resolution='1hour'이면 15/30/45분 슬롯 자체가
-    없으므로(09_compute_operating_status.py가 결측 슬롯 판정을 생략) 입력 시각의 "시"만
-    써서 정각 슬롯을 조회하고, '15min'이면 입력 시각 그대로 조회한다. 매장별로 그 시점
-    데이터가 아예 없으면(정각 슬롯 자체가 결측) 상태 관련 필드를 전부 null로 두고
-    message에 안내 문구를 채운다 - 없는 데이터를 다른 값으로 대체하지 않는다.
+    해상도 처리: 계기가 data_resolution='1hour'이면 입력 시각의 "시"만 써서 정각 슬롯을
+    조회하고, '15min'이면 입력 시각 그대로 조회한다. 현재는 21개 매장 전부 '15min'이다
+    (1시간 적산 계기는 02단계가 15분 구간으로 분해해 적재 - ami_db.resolution). 매장별로 그
+    시점 데이터가 아예 없으면 상태 관련 필드를 전부 null로 두고 message에 안내 문구를
+    채운다 - 없는 데이터를 다른 값으로 대체하지 않는다.
 
     final_status는 09단계가 실제로 계산하는 4값('영업중'/'휴무추정'/'예외영업'/'영업종료')
     중 '예외영업'을 '영업종료'로 접어 3값으로 단순화해서 내려준다(FINAL_STATUS_SIMPLE_MAP
@@ -574,8 +574,8 @@ def get_store_status_day(
     호출로 그릴 수 있게 하려는 목적(전력값 따로, 상태 따로 두 번 호출할 필요 없음).
 
     data_resolution='1hour'인 매장은 09_compute_operating_status.py가 결측 슬롯의 판정
-    자체를 생략(insert 안 함)하므로 rows 길이가 96보다 짧을 수 있다 - 매장당 1개 값으로
-    data_resolution을 같이 반환해 호출부(프론트)가 "빈 슬롯=결측 gap"임을 미리 알 수 있게 한다.
+    자체를 생략하므로 rows가 96보다 짧을 수 있어 매장당 1개 값으로 같이 반환한다. 현재는
+    21개 매장 전부 '15min'이다(1시간 적산 계기도 02단계가 15분 구간으로 분해해 적재).
 
     until_time 이후(미래) 슬롯은 반환하지 않는다. until_time을 안 주면 실제 벽시계의
     시:분만 target_date에 붙여서 컷오프로 쓴다(_day_series_cutoff 참고) - target_date가

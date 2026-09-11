@@ -33,8 +33,9 @@ class StoreSchema(BaseModel):
     )
     data_resolution: str = Field(
         default="15min", examples=["15min"],
-        description="'15min'(정상) | '1hour' - 이 계기가 recv_kWh를 매시 정각에만 리포트하는 계기면 '1hour'. "
-                    "결측이 아니라 계기 자체의 리포트 주기 특성 - 숨기지 않고 그대로 노출한다.",
+        description="'15min' | '1hour'. 현재 21개 매장 전부 '15min'이다 - 원천 계기가 1시간 적산값만 "
+                    "보고하는 5개 매장도 적재 단계에서 그 1시간을 이루는 15분 구간 4개로 분해했기 때문"
+                    "(분해된 행은 시계열의 is_redistributed=true).",
     )
 
 
@@ -93,9 +94,10 @@ class DayStatusRow(BaseModel):
     received_active_power_kwh: float | None = Field(default=None, description="15분 유효전력(kWh). 결측이면 null")
     is_synthetic: bool = Field(description="false=실측(2026-04-01~06-30), true=합성(2026-07-01~오늘)")
     is_redistributed: bool = Field(
-        description="true면 이 슬롯의 전력값이 실제 15분 단위 실측이 아니라, 같은 업종 코호트의 "
-                    "시간 내 상대 형태를 정각 실측값에 앵커링해 추정한 값(data_resolution='1hour' "
-                    "계기 중 한식 코호트가 충분한 경우에만 적용됨)"
+        description="true면 이 슬롯의 전력값은 계기가 15분 단위로 직접 잰 값이 아니라, 원천의 1시간 "
+                    "적산값을 그 1시간을 이루는 15분 구간 4개에 전압×전류 비율로 나눠 담은 값이다(4개 합은 "
+                    "실측 적산값과 일치). 원천이 1시간 적산만 보고하는 5개 매장의 모든 슬롯이 해당하고, "
+                    "전압·전류가 없는 1개 매장은 4등분."
     )
 
 
@@ -104,11 +106,11 @@ class DayStatusResponse(BaseModel):
     date: str = Field(examples=["2026-08-15"])
     data_resolution: str = Field(
         default="15min", examples=["15min"],
-        description="'15min'(정상, rows 96행) | '1hour' - 1hour인 매장은 결측 슬롯의 판정 자체를 "
-                    "생략하므로 rows 길이가 96보다 짧을 수 있다(빈 슬롯=결측 gap으로 해석할 것).",
+        description="'15min'(rows 하루 96행, 현재 전 매장) | '1hour'(결측 슬롯 판정이 생략돼 96행보다 "
+                    "짧을 수 있음).",
     )
     rows: list[DayStatusRow] = Field(
-        description="15분 슬롯당 1행. data_resolution='1hour'인 매장은 96행보다 적을 수 있다."
+        description="15분 슬롯당 1행(하루 96행). 기준 시각 이후 슬롯은 잘려서 더 적을 수 있다."
     )
 
 
@@ -449,7 +451,7 @@ class TimeseriesRow(BaseModel):
     )
     is_synthetic: bool
     is_redistributed: bool = Field(
-        description="true면 실제 15분 단위 실측이 아니라 코호트 비율로 추정한 값(DayStatusRow.is_redistributed와 동일 의미)"
+        description="DayStatusRow.is_redistributed와 같은 의미 - 원천의 1시간 적산값을 15분 구간으로 나눠 담은 값이면 true"
     )
 
 
@@ -459,9 +461,9 @@ class MeterTimeseriesResponse(BaseModel):
     is_synthetic: bool | None = None
     data_resolution: str = Field(
         default="15min", examples=["15min"],
-        description="'15min'(정상, rows 96행) | '1hour' - 1hour 계기는 rows 길이가 96보다 짧을 수 있다.",
+        description="'15min'(rows 하루 96행, 현재 전 계기) | '1hour'(96행보다 짧을 수 있음).",
     )
-    rows: list[TimeseriesRow] = Field(description="15분 슬롯당 1행. data_resolution='1hour'이면 96행보다 적을 수 있다.")
+    rows: list[TimeseriesRow] = Field(description="15분 슬롯당 1행(하루 96행). 기준 시각 이후 슬롯은 잘려서 더 적을 수 있다.")
 
 
 class StoreTimeseriesResponse(BaseModel):
@@ -471,6 +473,6 @@ class StoreTimeseriesResponse(BaseModel):
     is_synthetic: bool | None = None
     data_resolution: str = Field(
         default="15min", examples=["15min"],
-        description="'15min'(정상, rows 96행) | '1hour' - 1hour 계기는 rows 길이가 96보다 짧을 수 있다.",
+        description="'15min'(rows 하루 96행, 현재 전 계기) | '1hour'(96행보다 짧을 수 있음).",
     )
-    rows: list[TimeseriesRow] = Field(description="15분 슬롯당 1행. data_resolution='1hour'이면 96행보다 적을 수 있다.")
+    rows: list[TimeseriesRow] = Field(description="15분 슬롯당 1행(하루 96행). 기준 시각 이후 슬롯은 잘려서 더 적을 수 있다.")

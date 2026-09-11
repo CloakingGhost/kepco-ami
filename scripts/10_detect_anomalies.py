@@ -24,6 +24,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from ami_db import resolution  # noqa: E402
 from ami_db.anomaly import compute_group_thresholds, detect_events  # noqa: E402
 from ami_db.config import GENERATED_DIR, VIZ_OUTPUT, settings  # noqa: E402
 from ami_db.db import bulk_insert, get_raw_connection  # noqa: E402
@@ -34,7 +35,9 @@ def main() -> None:
     matched_csv = GENERATED_DIR / f"store_ami_matched_{settings.target_dong}.csv"
     meter_ids = pd.read_csv(matched_csv, encoding="utf-8-sig")["meter_id"].tolist()
 
-    real_ts_all = pd.read_pickle(VIZ_OUTPUT / "timeseries_clean.pkl")[["meter_id", "time", "recv_kWh"]]
+    real_ts_all = resolution.load_real_timeseries(VIZ_OUTPUT / "timeseries_clean.pkl", meter_ids)[
+        ["meter_id", "time", "recv_kWh"]
+    ]
 
     total = 0
     with get_raw_connection() as conn:

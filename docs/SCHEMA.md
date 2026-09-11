@@ -74,7 +74,7 @@ erDiagram
         text meter_id PK
         text line_name "'A' 고정"
         text match_status "matched / eligible_unmatched / ineligible"
-        text data_resolution "15min / 1hour"
+        text data_resolution "15min / 1hour (현재 전 매장 15min)"
         double contract_power_kw
         double multiplier "재계산 금지 - 이미 반영된 값"
     }
@@ -83,7 +83,7 @@ erDiagram
         timestamp ts PK
         double received_active_power_kwh
         boolean is_synthetic PK "실측(false) / 합성(true)"
-        boolean is_redistributed "코호트 비율 추정값(true)인지"
+        boolean is_redistributed "1시간 적산값을 15분으로 분해한 값(true)인지"
     }
     STORES {
         int store_id PK
@@ -176,7 +176,7 @@ A선로 전체 64개 계기를 매칭 성공 여부와 무관하게 전부 적�
 | `category_class` | `TEXT` | ✓ | 카테고리분류 (`02_match_store.py`의 `category_class()` 파생 로직과 동일) |
 | `power_class` | `TEXT` | ✓ | 전력분류: 규모×전압 조합 (`02_match_store.py`의 `power_class()` 파생 로직과 동일) |
 | `data_completeness` | `NUMERIC(5,2)` | ✓ | 실측 구간 결측률(%). `02_load_meta_and_timeseries.py`가 `timeseries_clean.pkl`의 실측 min~max 타임스탬프로 그리드 크기를 동적 계산해 A선로 64개 전체를 직접 재계산 (8,736 고정 분모 아님 — 아래 "data_resolution" 설명 참고) |
-| `data_resolution` | `TEXT` | NOT NULL, 기본값 `'15min'` | CHECK: `15min` \| `1hour`. `1hour`이면 `received_active_power_kwh`가 매시 정각에만 존재하는 계기(아래 설명 참고) |
+| `data_resolution` | `TEXT` | NOT NULL, 기본값 `'15min'` | CHECK: `15min` \| `1hour`. 원천이 1시간 적산인 계기도 02단계가 15분으로 분해한 뒤를 기준으로 재므로 현재 매칭 21개 전부 `15min`(아래 설명 참고) |
 | `match_status` | `TEXT` | NOT NULL, 기본값 `'ineligible'` | CHECK: `matched` \| `eligible_unmatched` \| `ineligible` (아래 참고) |
 | `created_at` | `TIMESTAMPTZ` | NOT NULL, 기본값 `now()` | 적재 시각 |
 
@@ -202,7 +202,7 @@ A선로 전체 64개 계기를 매칭 성공 여부와 무관하게 전부 적�
 | `voltage_a` / `voltage_b` / `voltage_c` | `DOUBLE PRECISION` | ✓ | 상별 전압 |
 | `current_a` / `current_b` / `current_c` | `DOUBLE PRECISION` | ✓ | 상별 전류 |
 | `is_synthetic` | `BOOLEAN` | NOT NULL | `false`=실측(2026-04-01~06-30), `true`=합성(2026-07-01~오늘). 서빙 로직은 이 값만 읽어서 응답에 실어 보냄 — 날짜 분기 코드 없음 |
-| `is_redistributed` | `BOOLEAN` | NOT NULL, 기본값 `FALSE` | `true`면 이 행의 `received_active_power_kwh`는 실측이 아니라 코호트 비율로 추정한 값(아래 "data_resolution/is_redistributed" 설명 참고). 지금은 `A-L-58` 한 계기만 해당 |
+| `is_redistributed` | `BOOLEAN` | NOT NULL, 기본값 `FALSE` | `true`면 이 행의 `received_active_power_kwh`는 계기가 15분 단위로 잰 값이 아니라, 원천의 1시간 적산값을 그 1시간을 이루는 15분 구간 4개에 전압×전류 비율로 나눠 담은 값(4개 합 = 실측 적산값, 아래 "data_resolution/is_redistributed" 설명 참고). 원천이 1시간 적산인 5개 계기(`A-L-16`/`19`/`49`/`58`/`70`)의 모든 행이 해당 |
 
 **PK:** `(meter_id, ts)`
 **인덱스:** PK 자체가 "특정 계기의 날짜범위 조회"에 이미 최적 인덱스. `idx_meter_timeseries_ts ON (ts)` — "특정 시각의 전 매장 스냅샷"(혼잡도 대시보드용) 조회를 위해 추가.
@@ -379,22 +379,21 @@ source별 이력을 보존합니다 — `google_places` 매칭이 성공해도 `
 **`data_completeness` — 어떻게/왜 쓰이는가**
 실측 구간(2026-04-01\~06-30) 중 실제로 값이 존재하는 비율(%)입니다. 예전엔 `meter_summary.csv`의 값을 그대로 옮겼지만, 지금은 `02_load_meta_and_timeseries.py`가 `timeseries_clean.pkl`의 실측 min~max 타임스탬프로 그리드 크기를 동적 계산해(`pd.date_range(..., freq="15min")`) A선로 64개 전체를 직접 재계산합니다 — 그리드 분모가 8,736 고정이 아니라 실제로는 8,737(91일치 range)이라 고정값을 쓰면 미세하게 틀립니다. **현재 서빙/판정 로직(`status.py`, `anomaly.py`)이 이 값을 직접 참조해 필터링하거나 가중치를 주지는 않습니다.**
 
-**`data_resolution`/`is_redistributed` — 왜 일부 계기만 완전성이 유독 낮은가 (근본원인 조사 결과)**
+**`data_resolution`/`is_redistributed` — 1시간 적산 계기를 15분으로 분해하는 이유와 방법 (2026-09-11 재조사)**
 
-화곡동 매칭 21개 중 5개 계기(`A-L-16`/`A-L-19`/`A-L-49`/`A-L-58`/`A-L-70`)의 `data_completeness`가 유독 \~25%로 낮게 나옵니다. 직접 값 단위로 뜯어본 결과 무작위 결측이 아니라 **계기 자체가 `received_active_power_kwh`를 매시 정각(HH:00)에만 리포트**하기 때문이었습니다 — 91일 전체 기간에서 예외 0건이고, 같은 계기의 전압/전류는 15분 그대로 정상입니다. A/B/C 선로 전체 129개로 넓혀 봐도 동일 패턴이 27개(21%)에서 재현돼, 일부 계기군의 통신 사양 차이로 판단했습니다. `data_resolution` 컬럼이 이 사실을 숨기지 않고 그대로 노출합니다(A선로 64개 중 17개가 `1hour`, 나머지 47개가 `15min`).
+화곡동 매칭 21개 중 5개 계기(`A-L-16`/`A-L-19`/`A-L-49`/`A-L-58`/`A-L-70`)는 원천 데이터에서 에너지 레지스터(유효·피상·무효 전력량)가 **매시 정각(HH:00)에만** 찍힙니다(91일 전체 예외 0건). 반면 같은 계기의 전압·전류는 15분마다 정상으로 들어옵니다(`A-L-49`만 예외 - 원천에 정각 유효전력량 외에는 아무 값도 없음). A/B/C 선로 전체 129개 중 27개(21%)에서 같은 패턴이 재현되는 계기군 특성입니다.
 
-조사 중 `data_completeness`가 100%로 표시돼 있었지만 실제로는 raw row 자체가 91일치의 1/4(2,184개)뿐이던 숨은 5번째 사례(`A-L-49`)도 찾아냈습니다 — 옛 `meter_summary.csv` 기반 지표로는 드러나지 않던 케이스라, 이걸 계기로 `data_completeness` 계산 자체를 위처럼 직접 재계산 방식으로 바꿨습니다.
+예전엔 이 정각값을 "15분 사용량 4개 중 1개만 보고되고 나머지는 유실된 값"으로 해석했습니다. 전압·전류로 교차검증해 보니 **정각 T의 값은 T로 끝나는 1시간(T-45·T-30·T-15·T로 끝나는 15분 구간 4개)의 적산값**이었습니다 - 그 4개 구간의 전압×전류로 적분한 피상전력량이 정각 kVAh와 ±0.3% 이내로 일치합니다. 즉 예전 해석은 이 계기들의 사용량을 15분 기준으로 약 4배 부풀려 보고 있었고, `A-L-58`의 "계약전력 5kW인데 이용률 p95 339%"라는 물리적으로 불가능한 수치도 이 때문이었습니다.
 
-`1hour` 계기 5곳 중 4곳(스터디카페·교습소·사무지원·꽃집)은 자연스러운 이용 주기가 1시간에 가깝거나 길어 해상도 플래그만으로 충분하다고 보고 그대로 뒀습니다. 반면 `A-L-58`(한식당 "조박사소머리국밥")은 식사 회전 주기가 20\~30분이라 1시간 해상도로는 혼잡도 표현이 너무 거칩니다. 그래서 이 계기 하나만:
+그래서 적재 단계에서 정각 적산값을 그 1시간을 이루는 15분 구간 4개에 **각 구간의 전압×전류 비율로** 나눠 담습니다(`ami_db.resolution.split_hourly_energy`). 4개 합은 실측 적산값과 정확히 같고 역률 가정이 필요 없습니다. 전압·전류가 전혀 없는 `A-L-49`는 모양 정보가 없어 4등분합니다. 분해된 슬롯은 전부 `is_redistributed=true`이고, 분해 후 기준으로 `data_resolution`은 21개 매장 전부 `15min`입니다.
 
-1. 같은 `biz_category_mid='한식'`인 다른 매칭 매장 8곳(전부 `15min` 정상 해상도)을 코호트로 묶어 시간대별 상대 비율표를 만들고 (`ami_db.resolution.build_hourly_ratio_table`),
-2. 정각 실측값을 기준점 삼아 그 비율을 곱해 15/30/45분 값을 추정합니다 (`ami_db.resolution.redistribute_hourly_store`) — "시간합계를 4등분"하는 게 아니라 "정각값에 코호트의 상대적 형태를 앵커링"하는 방식입니다. 정각값의 크기가 이웃 매장의 정상 15분값과 비슷한 스케일이라 "그 15분간 사용량 중 1개만 리포트되고 나머지 3개는 유실"로 해석하는 게 실측과 맞았습니다.
+방법 선택 근거(15분 정상 계기 15개를 인위적으로 1시간 합산했다가 되돌리는 백테스트: V×I 비례 분해 wMAPE 1.4%·편향 0%, 고정 역률 0.9 가정 15.4%·−8%, 4등분 11.2%)와 적용 전후 비교는 [`시간적산계기_15분분해_분석보고서.md`](시간적산계기_15분분해_분석보고서.md)에 따로 정리했습니다.
 
-실측 기간 기준 A-L-58의 `meter_timeseries` 8,739행 중 6,552행(75%), 합성 기간(07-01 이후, 06단계가 동일 재분배 후 프로파일링) 6,144행 중 4,608행(75%)이 이렇게 채워졌고, 전부 `is_redistributed=true`로 표시됩니다. 나머지 4개 계기는 재분배 없이 15/30/45분을 `NULL` 그대로 둡니다.
+조사 중 `data_completeness`가 100%로 표시돼 있었지만 실제로는 raw row 자체가 91일치의 1/4(2,184개)뿐이던 `A-L-49`도 찾아냈습니다 — 옛 `meter_summary.csv` 기반 지표로는 드러나지 않던 케이스라, 이걸 계기로 `data_completeness` 계산 자체를 위처럼 직접 재계산 방식으로 바꿨습니다.
 
-**⚠ 이 비율표 자체는 DB/파일 어디에도 저장되지 않습니다.** `02_load_meta_and_timeseries.py`(실측 적재)와 `06_generate_synthetic_timeseries.py`(합성 생성)가 각자 실행 시점에 `timeseries_clean.pkl`에서 코호트 비율표를 다시 계산해 그 자리에서 소비하고 버립니다(같은 원본 데이터를 쓰므로 두 스크립트가 계산한 비율은 항상 동일). 특정 시간대에 실제로 어떤 비율이 쓰였는지 다시 보려면 `ami_db.resolution.build_hourly_ratio_table()`을 그 시점의 `timeseries_clean.pkl`로 재실행해야 합니다 — 감사(audit) 트레일이 필요해지면 이 함수 호출 결과를 `output/generated/`에 별도로 저장하는 걸 고려할 것.
+**원천 pkl을 읽는 모든 단계는 `ami_db.resolution.load_real_timeseries()`를 거칩니다**(02 적재, 06 합성 프로파일, 09 night_baseline, 10 안전감지 baseline). 한 단계라도 원본 pkl을 직접 읽으면 그 단계만 1시간 적산 스케일로 계산하게 되므로 이 진입점을 우회하지 말 것.
 
-관련 코드: [`db/src/ami_db/resolution.py`](../src/ami_db/resolution.py), 09단계가 이 해상도를 반영해 결측 슬롯의 판정 자체를 생략하는 로직은 [`db/scripts/09_compute_operating_status.py`](../scripts/09_compute_operating_status.py)의 `compute_status_for_store()` 참고.
+관련 코드: [`db/src/ami_db/resolution.py`](../src/ami_db/resolution.py).
 
 ---
 

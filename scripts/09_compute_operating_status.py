@@ -20,6 +20,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from ami_db import resolution  # noqa: E402
 from ami_db.config import VIZ_OUTPUT, settings  # noqa: E402
 from ami_db.db import bulk_insert, get_raw_connection  # noqa: E402
 from ami_db.status import (  # noqa: E402
@@ -127,7 +128,7 @@ def compute_status_for_store(
 def main() -> None:
     # synthetic.compute_night_baseline()은 'time' 컬럼명을 기대한다(build_slot_profile과
     # 동일 관례 유지 - 06_generate_synthetic_timeseries.py에서 쓰는 것과 같은 원본 pkl 스키마).
-    real_ts_all = pd.read_pickle(VIZ_OUTPUT / "timeseries_clean.pkl")[["meter_id", "time", "recv_kWh"]]
+    real_ts_all = resolution.load_real_timeseries(VIZ_OUTPUT / "timeseries_clean.pkl")[["meter_id", "time", "recv_kWh"]]
 
     with get_raw_connection() as conn:
         with conn.cursor() as cur:

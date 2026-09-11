@@ -30,7 +30,7 @@ from datetime import date, timedelta
 from ami_db.serving import EARLIEST_SAMPLE_DATE, LATEST_SERVICE_DATE
 
 VALID_STORE_ID = 1  # 못난이찹쌀꽈배기 - google_places 없어 ksic_estimate 폴백 케이스 (data/serving_api.py EXAMPLE_STORE_ID와 동일)
-ONE_HOUR_STORE_ID = 2  # meters.data_resolution='1hour'인 계기(A-L-16)를 쓰는 매장
+HOURLY_SOURCE_STORE_ID = 2  # 원천 계기(A-L-16)가 1시간 적산값만 보고하는 매장 - 적재 시 15분으로 분해됨
 NONEXISTENT_STORE_ID = 999  # 21개 매장 범위(1~21) 밖 - stores 테이블에 존재하지 않음
 
 REAL_DATE = date(2026, 5, 15)        # 실측 구간, 그리드 가장자리 아님(96행)
@@ -167,16 +167,29 @@ class TestStoreStatusDay:
         assert len(rows) == 96
         assert all(r["is_synthetic"] is True for r in rows)
 
-    def test_normal_1hour_resolution_store_has_fewer_rows(self, client):
-        """정상(1hour 계기 매장): store_id=2, date=2026-08-15, time=23:45 -> 200, data_resolution='1hour', rows<96."""
-        resp = client.post(
-            "/api/stores/status/day",
-            json={"store_id": ONE_HOUR_STORE_ID, "date": SYNTHETIC_DATE.isoformat(), "time": "23:45"},
-        )
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["data_resolution"] == "1hour"
-        assert 0 < len(body["rows"]) < 96
+    def test_normal_hourly_source_store_is_split_into_96_slots(self, client):
+        """
+        회귀 방지: 원천 계기가 1시간 적산값만 보고하는 매장(store_id=2, A-L-16)도 적재 단계에서
+        15분 구간 4개로 분해되므로 하루 96행이 온다(실측·합성 모두). 분해된 행은 전부
+        is_redistributed=true - 예전엔 data_resolution='1hour' + 정각 24행만 와서 차트가
+        1시간마다 끊겼다.
+        """
+        for target_date in (REAL_DATE, SYNTHETIC_DATE):
+            resp = client.post(
+                "/api/stores/status/day",
+                json={"store_id": HOURLY_SOURCE_STORE_ID, "date": target_date.isoformat(), "time": "23:45"},
+            )
+            assert resp.status_code == 200
+            body = resp.json()
+            assert body["data_resolution"] == "15min"
+            assert len(body["rows"]) == 96
+            assert all(r["is_redistributed"] is True for r in body["rows"])
+
+    def test_all_stores_report_15min_resolution(self, client):
+        """21개 매장 전부 15분 데이터 - 프론트가 매장별 해상도를 분기할 필요가 없다는 계약."""
+        stores = client.get("/api/stores").json()["stores"]
+        assert len(stores) == 21
+        assert {s["data_resolution"] for s in stores} == {"15min"}
 
     def test_normal_no_time_never_leaks_past_current_time_of_day(self, client):
         """

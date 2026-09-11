@@ -43,12 +43,11 @@ CREATE TABLE IF NOT EXISTS meters (
                                                               -- 어긋남 - 아래 data_resolution 조사 과정에서 확인).
     data_resolution            TEXT NOT NULL DEFAULT '15min'
         CHECK (data_resolution IN ('15min', '1hour')),
-        -- '1hour': 이 계기는 recv_kWh가 매시 정각에만 리포트되고 15/30/45분은 항상 NULL/결측
-        -- (91일 전체 예외 0건 확인 - 무작위 결측이 아니라 계기 통신 사양 차이). A/B/C 선로
-        -- 전체 129개 중 27개(21%)에서 재현되는 계기군 특성. 매장매칭된 21개 중 5개
-        -- (A-L-16/19/49/58/70)가 여기 해당하며, 완전성(위 data_completeness)이 25%로 낮게 찍히는
-        -- 근본 원인이 바로 이것이다. 프론트/API 소비자가 "결측"과 "원래 이 해상도"를 구분할 수
-        -- 있도록 숨기지 않고 명시한다(해상도를 억지로 15분으로 부풀리지 않는다는 원칙).
+        -- '1hour': recv_kWh가 매시 정각에만 있는 계기(A/B/C 선로 129개 중 27개, 매칭 21개 중
+        -- A-L-16/19/49/58/70). 그 정각값은 15분값이 아니라 정각 T로 끝나는 1시간 적산값이라
+        -- (같은 계기의 15분 전압·전류로 적분한 피상전력량과 ±0.3% 일치), 02단계가 15분 구간
+        -- 4개로 분해해 적재하고 이 컬럼도 분해 후 기준으로 '15min'이 된다(ami_db.resolution,
+        -- db/docs/시간적산계기_15분분해_분석보고서.md). 현재 매칭 21개 전부 '15min'.
     match_status               TEXT NOT NULL DEFAULT 'ineligible'
         CHECK (match_status IN ('matched', 'eligible_unmatched', 'ineligible')),
         -- matched            : 화곡동 상가와 실제 1:1 매칭됨 (stores 테이블에 대응 행 존재)
@@ -77,13 +76,12 @@ CREATE TABLE IF NOT EXISTS meter_timeseries (
                                                               -- 날짜별 서빙 로직(ami_db.serving)은 "이 날짜가 실측이냐 합성이냐"를 판단하는
                                                               -- 별도 분기 코드가 전혀 없다 - 이 플래그만 그대로 읽어서 응답에 실어 보내면 끝난다.
     is_redistributed                BOOLEAN NOT NULL DEFAULT FALSE,
-                                                              -- true = 이 행의 recv_kWh는 정각 실측이 아니라, 같은 업종 코호트의
-                                                              -- 시간 내 상대 형태(hourly ratio table)를 그 시간대 정각 실측값에
-                                                              -- 앵커링해 추정한 값(resolution.redistribute_hourly_store 참고).
-                                                              -- data_resolution='1hour'인 계기 중 A-L-58(한식 코호트 충분)에만
-                                                              -- 적용되고, 원래 행이 아예 없던 15/30/45분 슬롯도 이 값이 true인 채로
-                                                              -- 새로 생성된다. 나머지 4개 1hour 계기는 이 재분배를 적용하지 않고
-                                                              -- 결측을 결측 그대로(NULL) 남긴다(해상도 플래그만으로 투명화).
+                                                              -- true = 이 행의 recv_kWh는 계기가 15분 단위로 잰 값이 아니라,
+                                                              -- 원천의 1시간 적산값(정각 T)을 T로 끝나는 15분 구간 4개에 그 구간
+                                                              -- 전압×전류 비율로 나눠 담은 값(4개 합 = 실측 적산값). 전압·전류가
+                                                              -- 없는 계기(A-L-49)는 4등분. 원천에 행이 없던 구간도 이 값이 true인
+                                                              -- 채로 새로 생성된다(ami_db.resolution.split_hourly_energy).
+                                                              -- 합성 행은 그 계기 실측이 분해값이면 전부 true(분해된 프로파일에서 샘플링).
     PRIMARY KEY (meter_id, ts)
 );
 -- (meter_id, ts) PK 자체가 "특정 계기의 날짜범위 조회"에 이미 최적 인덱스라 별도 복합 인덱스는 불필요.

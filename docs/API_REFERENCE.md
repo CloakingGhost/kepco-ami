@@ -3,7 +3,7 @@
 > 이 문서는 `scripts/generate_api_docs.py`가 FastAPI OpenAPI 스키마에서 **자동 생성**했습니다.
 > 코드(엔드포인트·모델)를 고쳤다면 재생성하세요: `uv run python scripts/generate_api_docs.py`
 >
-> 버전: `0.1.0` · 생성 시각: `2026-09-10 07:06 UTC`
+> 버전: `0.1.0` · 생성 시각: `2026-09-11 04:19 UTC`
 
 **Base URL(로컬)**: `http://localhost:8000`  (Swagger UI: `http://localhost:8000/docs`)
 
@@ -53,7 +53,7 @@
 | `biz_category_mid` | `string \| null` |  |
 | `dong_name` | `string` |  |
 | `match_note` | `string` |  |
-| `data_resolution` | `string` | '15min'(정상) | '1hour' - 이 계기가 recv_kWh를 매시 정각에만 리포트하는 계기면 '1hour'. 결측이 아니라 계기 자체의 리포트 주기 특성 - 숨기지 않고 그대로 노출한다. |
+| `data_resolution` | `string` | '15min' | '1hour'. 현재 21개 매장 전부 '15min'이다 - 원천 계기가 1시간 적산값만 보고하는 5개 매장도 적재 단계에서 그 1시간을 이루는 15분 구간 4개로 분해했기 때문(분해된 행은 시계열의 is_redistributed=true). |
 
 </details>
 
@@ -142,10 +142,10 @@ store_id가 1~21 범위를 벗어나면 404, date/time 형식이 잘못되면 40
 (원래는 실측 구간만 받았는데, 안전감지 데모가 7월에만 있어 지도와 안전감지 패널이
 서로 다른 날짜를 봐야 하는 문제가 있어 넓혔다).
 
-계기 해상도 처리: data_resolution='1hour'인 매장(5개)은 15/30/45분 슬롯이 애초에
-없으므로 입력 시각의 "시"만 사용해 정각 데이터를 가져온다(예: 19:15 입력 -> 19:00 슬롯).
-나머지 '15min' 매장은 입력 시각을 그대로 사용한다. 매장별로 그 시점 데이터 자체가
-없으면(정각 슬롯 결측 등) 상태 관련 필드가 전부 null이 되고 message에 안내 문구가 채워진다.
+계기 해상도: 21개 매장 전부 15분 데이터를 가진다 - 원천 계기가 1시간 적산값만 보고하는
+5개 매장도 적재 단계에서 15분 구간 4개로 분해했다(해당 값은 시계열 API의
+is_redistributed=true로 구분). 매장별로 그 시점 데이터 자체가 없으면 상태 관련 필드가
+전부 null이 되고 message에 안내 문구가 채워진다.
 
 final_status는 내부 4값 중 '예외영업'을 '영업종료'로 접어 영업중/휴무추정/영업종료
 3값으로만 내려준다(일반 사용자는 영업 중인지 아닌지만 판단하면 되기 때문).
@@ -254,8 +254,8 @@ store_id 범위를 벗어나면 404, date/time이 조회 가능 범위 밖이면
 |---|---|---|
 | `store_id` | `integer` |  |
 | `date` | `string` |  |
-| `data_resolution` | `string` | '15min'(정상, rows 96행) | '1hour' - 1hour인 매장은 결측 슬롯의 판정 자체를 생략하므로 rows 길이가 96보다 짧을 수 있다(빈 슬롯=결측 gap으로 해석할 것). |
-| `rows` | `DayStatusRow[]` | 15분 슬롯당 1행. data_resolution='1hour'인 매장은 96행보다 적을 수 있다. |
+| `data_resolution` | `string` | '15min'(rows 하루 96행, 현재 전 매장) | '1hour'(결측 슬롯 판정이 생략돼 96행보다 짧을 수 있음). |
+| `rows` | `DayStatusRow[]` | 15분 슬롯당 1행(하루 96행). 기준 시각 이후 슬롯은 잘려서 더 적을 수 있다. |
 
 <details><summary><code>DayStatusRow</code> 필드 상세</summary>
 
@@ -268,7 +268,7 @@ store_id 범위를 벗어나면 404, date/time이 조회 가능 범위 밖이면
 | `congestion_level` | `integer` | 혼잡도 코드. 0=해당없음 | 1=여유 | 2=보통 | 3=혼잡 |
 | `received_active_power_kwh` | `number \| null` | 15분 유효전력(kWh). 결측이면 null |
 | `is_synthetic` | `boolean` | false=실측(2026-04-01~06-30), true=합성(2026-07-01~오늘) |
-| `is_redistributed` | `boolean` | true면 이 슬롯의 전력값이 실제 15분 단위 실측이 아니라, 같은 업종 코호트의 시간 내 상대 형태를 정각 실측값에 앵커링해 추정한 값(data_resolution='1hour' 계기 중 한식 코호트가 충분한 경우에만 적용됨) |
+| `is_redistributed` | `boolean` | true면 이 슬롯의 전력값은 계기가 15분 단위로 직접 잰 값이 아니라, 원천의 1시간 적산값을 그 1시간을 이루는 15분 구간 4개에 전압×전류 비율로 나눠 담은 값이다(4개 합은 실측 적산값과 일치). 원천이 1시간 적산만 보고하는 5개 매장의 모든 슬롯이 해당하고, 전압·전류가 없는 1개 매장은 4등분. |
 
 </details>
 
@@ -542,8 +542,8 @@ meter_id를 body로 받는다(URL에 meter_id를 노출하지 않으려고 POST�
 | `meter_id` | `string` |  |
 | `date` | `string` |  |
 | `is_synthetic` | `boolean \| null` |  |
-| `data_resolution` | `string` | '15min'(정상, rows 96행) | '1hour' - 1hour 계기는 rows 길이가 96보다 짧을 수 있다. |
-| `rows` | `TimeseriesRow[]` | 15분 슬롯당 1행. data_resolution='1hour'이면 96행보다 적을 수 있다. |
+| `data_resolution` | `string` | '15min'(rows 하루 96행, 현재 전 계기) | '1hour'(96행보다 짧을 수 있음). |
+| `rows` | `TimeseriesRow[]` | 15분 슬롯당 1행(하루 96행). 기준 시각 이후 슬롯은 잘려서 더 적을 수 있다. |
 
 <details><summary><code>TimeseriesRow</code> 필드 상세</summary>
 
@@ -554,7 +554,7 @@ meter_id를 body로 받는다(URL에 meter_id를 노출하지 않으려고 POST�
 | `congestion_level` | `integer` | 혼잡도 코드. 0=해당없음(영업중이 아니거나 판정 없음) | 1=여유 | 2=보통 | 3=혼잡. 차트에 그대로 시리즈로 그릴 수 있도록 문자열이 아닌 정수로 내려간다. |
 | `final_status` | `string \| null` | '영업중' | '휴무추정' | '영업종료' | null(판정 없음) |
 | `is_synthetic` | `boolean` |  |
-| `is_redistributed` | `boolean` | true면 실제 15분 단위 실측이 아니라 코호트 비율로 추정한 값(DayStatusRow.is_redistributed와 동일 의미) |
+| `is_redistributed` | `boolean` | DayStatusRow.is_redistributed와 같은 의미 - 원천의 1시간 적산값을 15분 구간으로 나눠 담은 값이면 true |
 
 </details>
 
@@ -574,8 +574,8 @@ meter_timeseries와 동일하나 store_id(상가 기준)로 조회한다.
 | `meter_id` | `string` |  |
 | `date` | `string` |  |
 | `is_synthetic` | `boolean \| null` |  |
-| `data_resolution` | `string` | '15min'(정상, rows 96행) | '1hour' - 1hour 계기는 rows 길이가 96보다 짧을 수 있다. |
-| `rows` | `TimeseriesRow[]` | 15분 슬롯당 1행. data_resolution='1hour'이면 96행보다 적을 수 있다. |
+| `data_resolution` | `string` | '15min'(rows 하루 96행, 현재 전 계기) | '1hour'(96행보다 짧을 수 있음). |
+| `rows` | `TimeseriesRow[]` | 15분 슬롯당 1행(하루 96행). 기준 시각 이후 슬롯은 잘려서 더 적을 수 있다. |
 
 <details><summary><code>TimeseriesRow</code> 필드 상세</summary>
 
@@ -586,7 +586,7 @@ meter_timeseries와 동일하나 store_id(상가 기준)로 조회한다.
 | `congestion_level` | `integer` | 혼잡도 코드. 0=해당없음(영업중이 아니거나 판정 없음) | 1=여유 | 2=보통 | 3=혼잡. 차트에 그대로 시리즈로 그릴 수 있도록 문자열이 아닌 정수로 내려간다. |
 | `final_status` | `string \| null` | '영업중' | '휴무추정' | '영업종료' | null(판정 없음) |
 | `is_synthetic` | `boolean` |  |
-| `is_redistributed` | `boolean` | true면 실제 15분 단위 실측이 아니라 코호트 비율로 추정한 값(DayStatusRow.is_redistributed와 동일 의미) |
+| `is_redistributed` | `boolean` | DayStatusRow.is_redistributed와 같은 의미 - 원천의 1시간 적산값을 15분 구간으로 나눠 담은 값이면 true |
 
 </details>
 
